@@ -1,0 +1,66 @@
+{
+  "summary": "Routing 页「路由组」一节的表头不再每敲一个键就整行重建：只有在表头组成真的变化（如点击「选择」、删掉组、只剩一个组）时才重建，因此正在输入的筛选框在打字过程中始终是同一个节点、焦点与光标不再被手工搬回。",
+  "scenes": [
+    {
+      "title": "路由组筛选框逐键输入",
+      "shots": [
+        {
+          "file": "01-groups-section-before.png",
+          "caption": "「路由组」一节：筛选框与旁边的「选择」「新建组」",
+          "width": 2560
+        },
+        {
+          "file": "02-filter-after-one-key.png",
+          "caption": "按一次键后筛选框里的内容与下面的列表",
+          "width": 2560
+        },
+        {
+          "file": "03-filter-after-five-keys.png",
+          "caption": "再敲三个键后筛选框里的内容与下面的列表",
+          "width": 2560
+        },
+        {
+          "file": "04-filter-after-escape.png",
+          "caption": "按 Esc 之后筛选框与列表",
+          "width": 2560
+        }
+      ]
+    },
+    {
+      "title": "表头组成变化时仍然重建",
+      "shots": [
+        {
+          "file": "05-groups-head-before.png",
+          "caption": "表头：筛选框、「选择」、「新建组」",
+          "width": 2560
+        },
+        {
+          "file": "06-groups-head-while-typing.png",
+          "caption": "筛选框里有内容时的表头",
+          "width": 2560
+        },
+        {
+          "file": "07-groups-head-while-typing.png",
+          "caption": "筛选框有内容时的表头：筛选框与旁边的按钮",
+          "width": 2560
+        },
+        {
+          "file": "08-groups-head-after-clear.png",
+          "caption": "清空筛选后的表头与路由组列表",
+          "width": 2560
+        }
+      ]
+    }
+  ],
+  "video": "preview.mp4",
+  "poster": "poster.png",
+  "errors": [
+    "表头组成变化时仍然重建 · click .rt-gselect: won't press \"选择 选出几个组一起移除\""
+  ],
+  "leak": false,
+  "skipped": null,
+  "mismatch": "",
+  "unseen": "沙盒里的浏览器是 Chromium，逐键输入本来就只落一个字符，所以报告者看到的「一次按键两个字符」以及 WebKit（macOS / WebKitGTK）上的表现无法在这里复现；窄宽度窗口与 gui-ja / gui-de 语言也没在这里跑。这里能看到的只是：筛选框在连续按键中保持焦点与光标、每次按键出一个字符，以及表头在组成变化时仍然重建。",
+  "interactive": true,
+  "pages": 1
+}

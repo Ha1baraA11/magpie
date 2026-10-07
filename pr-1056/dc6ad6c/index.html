@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>#1056 界面预览 · dc6ad6c</title>
+<style>:root{color-scheme:light dark;--bg:#f6f6f7;--fg:#1d1d1f;--muted:#6e6e73;--card:#fff;--line:#e5e5ea}
+@media (prefers-color-scheme:dark){:root{--bg:#111113;--fg:#f2f2f4;--muted:#9a9aa0;--card:#1c1c1f;--line:#2c2c30}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.6 -apple-system,"Segoe UI","PingFang SC","Noto Sans CJK SC",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:28px 16px 60px}h1{font-size:20px;margin:0 0 4px}.m{color:var(--muted);font-size:13px;margin:0 0 20px}
+video,img{display:block;width:100%;border-radius:10px;border:1px solid var(--line);background:var(--card)}figure{margin:0 0 28px}figcaption{color:var(--muted);font-size:13px;margin-top:8px}
+a{color:inherit}</style>
+<main><h1>#1056 界面预览</h1><p class="m">commit dc6ad6c · <a href="https://github.com/yetone/magpie/pull/1056">回到 PR</a> · Routing 页「路由组」一节的表头不再每敲一个键就整行重建：只有在表头组成真的变化（如点击「选择」、删掉组、只剩一个组）时才重建，因此正在输入的筛选框在打字过程中始终是同一个节点、焦点与光标不再被手工搬回。</p>
+<figure><video src="preview.mp4" controls autoplay muted playsinline poster="poster.png"></video><figcaption>红线是鼠标走过的轨迹，红色圆环是一次点击；底部文字是这一步在做什么。空格暂停，← → 逐段查看。</figcaption></figure>
+<figure><img src="01-groups-section-before.png" alt="「路由组」一节：筛选框与旁边的「选择」「新建组」"><figcaption>路由组筛选框逐键输入 · 「路由组」一节：筛选框与旁边的「选择」「新建组」</figcaption></figure>
+<figure><img src="02-filter-after-one-key.png" alt="按一次键后筛选框里的内容与下面的列表"><figcaption>路由组筛选框逐键输入 · 按一次键后筛选框里的内容与下面的列表</figcaption></figure>
+<figure><img src="03-filter-after-five-keys.png" alt="再敲三个键后筛选框里的内容与下面的列表"><figcaption>路由组筛选框逐键输入 · 再敲三个键后筛选框里的内容与下面的列表</figcaption></figure>
+<figure><img src="04-filter-after-escape.png" alt="按 Esc 之后筛选框与列表"><figcaption>路由组筛选框逐键输入 · 按 Esc 之后筛选框与列表</figcaption></figure>
+<figure><img src="05-groups-head-before.png" alt="表头：筛选框、「选择」、「新建组」"><figcaption>表头组成变化时仍然重建 · 表头：筛选框、「选择」、「新建组」</figcaption></figure>
+<figure><img src="06-groups-head-while-typing.png" alt="筛选框里有内容时的表头"><figcaption>表头组成变化时仍然重建 · 筛选框里有内容时的表头</figcaption></figure>
+<figure><img src="07-groups-head-while-typing.png" alt="筛选框有内容时的表头：筛选框与旁边的按钮"><figcaption>表头组成变化时仍然重建 · 筛选框有内容时的表头：筛选框与旁边的按钮</figcaption></figure>
+<figure><img src="08-groups-head-after-clear.png" alt="清空筛选后的表头与路由组列表"><figcaption>表头组成变化时仍然重建 · 清空筛选后的表头与路由组列表</figcaption></figure>
+</main></html>
