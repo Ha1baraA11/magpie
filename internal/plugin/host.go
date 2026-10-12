@@ -16,12 +16,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/netproxy"
 	"github.com/yetone/magpie/internal/settings"
 )
@@ -491,6 +493,54 @@ type writeReq struct {
 type Loaded struct {
 	Spec  string `json:"spec"`
 	Error string `json:"error,omitempty"`
+	// Provides are the provider ids its auth hooks sign in to
+	Provides []string `json:"provides,omitempty"`
+	// ServedBy is, for each of them another plugin signs in to and
+	// serves, that plugin's spec: the host runs one plugin per provider
+	// id (Prefer)
+	ServedBy map[string]string `json:"servedBy,omitempty"`
+}
+
+// Clash is a provider id more than one plugin signs in to. The host runs
+// one of them for it: the one the user picked (Prefer), else the last in
+// plugins.json, as OpenCode does. The others' sign-in to it goes unused.
+type Clash struct {
+	ID string `json:"id"` // the provider id, OpenCode's
+	By string `json:"by"` // the spec of the plugin that serves it
+	// With are the other plugins that sign in to it
+	With []string `json:"with"`
+}
+
+// Clashes are the provider ids each loaded plugin shares with another,
+// by the plugin's spec.
+func Clashes(loaded []Loaded) map[string][]Clash {
+	who := map[string][]string{}
+	var ids []string
+	for _, l := range loaded {
+		for _, id := range l.Provides {
+			if who[id] == nil {
+				ids = append(ids, id)
+			}
+			who[id] = append(who[id], l.Spec)
+		}
+	}
+	out := map[string][]Clash{}
+	for _, id := range ids {
+		specs := who[id]
+		if len(specs) < 2 {
+			continue
+		}
+		by := ""
+		for _, l := range loaded {
+			if slices.Contains(specs, l.Spec) && l.ServedBy[id] == "" {
+				by = l.Spec
+			}
+		}
+		for _, s := range specs {
+			out[s] = append(out[s], Clash{ID: id, By: by, With: slices.DeleteFunc(slices.Clone(specs), func(x string) bool { return x == s })})
+		}
+	}
+	return out
 }
 
 var (
@@ -770,13 +820,8 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		proxy:    proxy,
 		proxyAt:  time.Now(),
 	}
-	go func() {
-		sc := bufio.NewScanner(stderr)
-		sc.Buffer(make([]byte, 64<<10), 4<<20)
-		for sc.Scan() {
-			log.Printf("plugin: %s", sc.Text())
-		}
-	}()
+	go drainStderr(stderr)
+
 	go h.read(out)
 	go h.writerLoop()
 	go h.ctrlLoop()
@@ -790,9 +835,9 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	var items []item
 	for _, e := range l.Plugins {
-		// a plugin that is only gateway middleware runs in the gateway
-		// (internal/middleware), not here
-		if _, only := Middleware(Target(e.Spec)); !e.Off && !only {
+		// a plugin that is only gateway middleware or an agent runs in
+		// magpie (internal/middleware, internal/agentplug), not here
+		if !e.Off && !InMagpieOnly(Target(e.Spec)) {
 			items = append(items, item{e.Spec, Target(e.Spec), e.Options})
 		}
 	}
@@ -807,6 +852,7 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		"piPath":        pi,
 		"directory":     settings.Dir(),
 		"config":        l.Config,
+		"prefer":        l.Prefer,
 		"plugins":       items,
 	}, &res)
 	if err != nil {
@@ -821,6 +867,21 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		}
 	}
 	return h, false, nil
+}
+
+// drainStderr logs the child's stderr a line at a time. A line over 4 MiB
+// stops the scanner; the rest is read and dropped, so the child is never left
+// blocked on a pipe nobody reads, and the log says from where.
+func drainStderr(r io.Reader) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		log.Printf("plugin: %s", sc.Text())
+	}
+	if errors.Is(sc.Err(), bufio.ErrTooLong) {
+		log.Printf("plugin: a stderr line over 4 MiB; the plugin's stderr is dropped from here on")
+	}
+	io.Copy(io.Discard, r)
 }
 
 func (h *host) read(out io.Reader) {
@@ -875,6 +936,10 @@ func (h *host) dispatch(m message) {
 		switch m.Event {
 		case "auth":
 			changed()
+		case "recovered":
+			// the host read plugin-auth.json from its last good
+			// generation (#1505): the GUI says so
+			lastgood.Noted(AuthPath(), m.Said)
 		case "renewing":
 			h.renewing.Store(int32(m.Count))
 		case "signIn":
@@ -1236,6 +1301,11 @@ func Call(ctx context.Context, method string, params, out any) error {
 // Background listings allow the host its own startup budget. The optional
 // timeout begins only after initialization and bounds just the requested RPC.
 func callWithTimeout(ctx context.Context, method string, params, out any, timeout time.Duration) error {
+	// a read the user didn't ask for, held back (#1518): the plugin isn't
+	// asked either, nor does its host start for it
+	if err := netproxy.Held(ctx); err != nil {
+		return err
+	}
 	startup := ctx
 	if timeout > 0 {
 		startup = context.WithoutCancel(ctx)
@@ -1316,7 +1386,24 @@ func hostProxy(env []string) string {
 
 // proxyLookEvery is how often get asks whether the proxy moved: the
 // system's is read again at most every 15 seconds anyway (netproxy.System).
-var proxyLookEvery = 15 * time.Second
+// A host started with none asks every 2 seconds, as netproxy reads the
+// system's again then: at login the proxy app comes up after magpie
+// (#1518), and the host's requests went direct until it was asked.
+var (
+	proxyLookEvery = 15 * time.Second
+	proxyLookNone  = 2 * time.Second
+)
+
+// proxied is whether a hostProxy names a proxy at all.
+func proxied(hp string) bool {
+	for _, e := range strings.Split(hp, "\x00") {
+		k, v, _ := strings.Cut(e, "=")
+		if v != "" && !strings.EqualFold(k, "NO_PROXY") {
+			return true
+		}
+	}
+	return false
+}
 
 // proxyMoved is whether magpie's proxy is no longer the one h was started
 // with (#1363): host.js reads it once, so a host started at login before
@@ -1327,7 +1414,11 @@ var proxyLookEvery = 15 * time.Second
 // changed in Settings never reached a running host either. Called under
 // hostMu.
 func (h *host) proxyMoved() bool {
-	if h.proxyAt.IsZero() || time.Since(h.proxyAt) < proxyLookEvery {
+	every := proxyLookEvery
+	if !proxied(h.proxy) {
+		every = min(every, proxyLookNone)
+	}
+	if h.proxyAt.IsZero() || time.Since(h.proxyAt) < every {
 		return false
 	}
 	h.proxyAt = time.Now()
@@ -1357,6 +1448,9 @@ func hostEnv(env []string) []string {
 // Fetch sends r through the provider's plugin — its loader's fetch, or
 // Bun's own when it gives none — and streams back the reply.
 func Fetch(ctx context.Context, r FetchRequest) (*http.Response, error) {
+	if err := netproxy.Held(ctx); err != nil {
+		return nil, err
+	}
 	h, err := get(ctx)
 	if err != nil {
 		return nil, err

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"math"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
@@ -19,6 +21,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/yetone/magpie/internal/edit"
+	"github.com/yetone/magpie/internal/filememo"
 	"github.com/yetone/magpie/internal/imagemcp"
 )
 
@@ -34,6 +37,26 @@ type Server struct {
 	URL       string            `json:"url,omitempty"`
 	Headers   map[string]string `json:"headers,omitempty"`
 	Agents    []string          `json:"agents"`
+	// DisabledTools are the server's tools its agents leave out, by the
+	// names the server gives them, written in each agent's own way where
+	// it has one (mcp_tools_off.go)
+	DisabledTools []string `json:"disabledTools,omitempty"`
+	// OAuth is an OAuth app of the user's own that magpie signs in to the
+	// server as, for one whose sign-in doesn't let magpie register itself
+	// (GitHub's, 新v学员 on Discord). It is magpie's alone: the agents are
+	// given the server as before.
+	OAuth *OAuthApp `json:"oauth,omitempty"`
+}
+
+// OAuthApp is an OAuth app made with a server's vendor, by the names
+// Claude Code gives one (--client-id, --client-secret, --callback-port;
+// "oauth": {"clientId", "callbackPort"}).
+type OAuthApp struct {
+	ClientID     string `json:"clientId"`
+	ClientSecret string `json:"clientSecret,omitempty"`
+	// CallbackPort is the port of the callback URL the app was made with;
+	// 0 for one made with http://localhost/callback, which takes any
+	CallbackPort int `json:"callbackPort,omitempty"`
 }
 
 // Remote reports whether the server is reached by URL.
@@ -75,6 +98,23 @@ func (s *Server) check() error {
 		s.Command, s.Args, s.Env = "", nil, nil
 	default:
 		return fmt.Errorf("%s: unknown transport %q", s.Name, s.Transport)
+	}
+	// magpie signs in only to a streamable HTTP server
+	if s.Transport != "http" {
+		s.OAuth = nil
+	} else if s.OAuth != nil {
+		a := *s.OAuth
+		a.ClientID, a.ClientSecret = strings.TrimSpace(a.ClientID), strings.TrimSpace(a.ClientSecret)
+		if a.CallbackPort < 0 || a.CallbackPort > 65535 {
+			return fmt.Errorf("%s: the callback port has to be from 1 to 65535", s.Name)
+		}
+		s.OAuth = &a
+		if a.ClientID == "" {
+			if a.ClientSecret != "" || a.CallbackPort != 0 {
+				return fmt.Errorf("%s: the OAuth app needs its client ID", s.Name)
+			}
+			s.OAuth = nil
+		}
 	}
 	for k := range s.Env {
 		if strings.TrimSpace(k) == "" {
@@ -141,6 +181,9 @@ const (
 	// fmtAlma is Alma's ~/.config/alma/mcp.json: a url is streamable HTTP
 	// (SSE when that fails) unless transport says sse, a command stdio
 	fmtAlma
+	// fmtZed is Zed's settings.json context_servers: command/args/env, or
+	// url/headers, which Zed speaks streamable HTTP to
+	fmtZed
 )
 
 // mcpFile is the file an agent keeps its user-wide MCP servers in.
@@ -180,6 +223,8 @@ func (f *mcpFile) key() string {
 		return "extensions"
 	case fmtZCode:
 		return "mcp.servers"
+	case fmtZed:
+		return "context_servers"
 	}
 	return "mcpServers"
 }
@@ -189,7 +234,7 @@ func (f *mcpFile) supports(s *Server) error {
 	if f.Format == fmtDesktop && s.Remote() {
 		return errNoRemote
 	}
-	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode) {
+	if s.Transport == "sse" && (f.Format == fmtCodex || f.Format == fmtGoose || f.Format == fmtDsh || f.Format == fmtPiNative || f.Format == fmtGrok || f.Format == fmtCommandCode || f.Format == fmtZed) {
 		return errNoSSE
 	}
 	if f.Format == fmtDsh && s.Name != "" && !dshServerName.MatchString(s.Name) {
@@ -206,6 +251,23 @@ func (f *mcpFile) supports(s *Server) error {
 // backslash in it, or …/npx.cmd.
 var windowsPath = regexp.MustCompile(`^[A-Za-z]:[\\/]|\\|(?i)\.(?:exe|cmd|bat|ps1)$`)
 
+// foreign says why an entry by the server's name that magpie can't read as
+// a server is one it mustn't write over, or nil: Zed's server from an
+// extension is its "settings" alone, which a command written beside it
+// would take the place of, and taking the server off Zed then would take
+// the extension's settings with it.
+func (f *mcpFile) foreign(old map[string]any) error {
+	if f.Format != fmtZed || old == nil {
+		return nil
+	}
+	if _, ok := f.decode("", old); ok {
+		return nil
+	}
+	return errZedExtension
+}
+
+var errZedExtension = errors.New("Zed has a server by this name from one of its extensions, which magpie leaves as it is: give the server another name to give it to Zed")
+
 // errNoRemote is what the page says of an app that reaches only a server
 // it runs itself (Claude Desktop, whose remote ones are its Connectors).
 var errNoRemote = errors.New("no-remote")
@@ -213,7 +275,8 @@ var errNoRemote = errors.New("no-remote")
 // errNoSSE is what the page says of an agent that can't reach a server
 // over SSE (Codex, Goose, DeepSeek Harness, Pi's own MCP, Grok Build — its
 // type = "sse" is taken, but it speaks streamable HTTP to it all the same,
-// Command Code, whose own add refuses sse).
+// Command Code, whose own add refuses sse, Zed, whose only remote transport
+// POSTs to the url: crates/context_server/src/transport/http.rs).
 var errNoSSE = errors.New("no-sse")
 
 // ordered is a JSON object that keeps its keys in the order given, so an
@@ -366,7 +429,12 @@ func (f *mcpFile) encode(s *Server) ordered {
 			optional("environment", s.Env)
 		}
 		add("enabled", true)
-	case fmtCursor, fmtDesktop:
+	case fmtCursor, fmtDesktop, fmtZed:
+		// Zed's own Add Local Server and Add Remote Server write these keys
+		// (docs/src/ai/mcp.md); its settings read a command as the Stdio
+		// form and a url as the Http one, with no "source" or "type"
+		// (crates/settings_content/src/project.rs
+		// ContextServerSettingsContent, zed-industries/zed 2c99f547)
 		if s.Remote() {
 			add("url", s.URL)
 			optional("headers", s.Headers)
@@ -563,16 +631,21 @@ func (f *mcpFile) encode(s *Server) ordered {
 			add("tool_timeout_sec", t)
 		}
 	case fmtDsh:
+		// a reference is a !!js expression dsh evaluates (dshRef)
 		add("serverName", s.Name)
 		if s.Remote() {
 			add("transport", "streamable-http")
 			add("url", s.URL)
-			optional("headers", s.Headers)
+			if len(s.Headers) > 0 {
+				add("headers", dshRefs(s.Headers))
+			}
 		} else {
 			add("transport", "stdio")
 			add("command", s.Command)
 			add("args", list(s.Args))
-			optional("env", s.Env)
+			if len(s.Env) > 0 {
+				add("env", dshRefs(s.Env))
+			}
 		}
 	}
 	return o
@@ -677,17 +750,26 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 			local(str(m, "command"), m["args"], m["env"])
 		}
 	case fmtDsh:
-		// a value dsh works out itself (!!js) isn't one magpie can hold
+		// a variable read as dshRef writes it is a reference; any other
+		// value dsh works out itself (!!js) isn't one magpie can hold
+		headers, env := dshUnrefs(m["headers"]), dshUnrefs(m["env"])
 		for _, k := range owned[fmtDsh] {
-			if hasJS(m[k]) {
+			v := m[k]
+			switch k {
+			case "headers":
+				v = headers
+			case "env":
+				v = env
+			}
+			if hasJS(v) {
 				return nil, false
 			}
 		}
 		switch str(m, "transport") {
 		case "stdio":
-			local(str(m, "command"), m["args"], m["env"])
+			local(str(m, "command"), m["args"], env)
 		case "streamable-http":
-			remote("http", str(m, "url"), m["headers"])
+			remote("http", str(m, "url"), headers)
 		}
 	case fmtHermes, fmtKimi, fmtDevin, fmtAlma:
 		// each takes a url over a command when an entry has both
@@ -748,7 +830,7 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 		} else {
 			local(str(m, "command"), m["args"], m["env"])
 		}
-	default: // Claude Code, Cursor, Copilot, Crush, ZCode, omp, Grok
+	default: // Claude Code, Cursor, Copilot, Crush, ZCode, omp, Grok, Zed
 		t := str(m, "type")
 		if u := str(m, "url"); u != "" {
 			if t != "sse" {
@@ -770,17 +852,44 @@ func (f *mcpFile) decode(name string, m map[string]any) (*Server, bool) {
 	return s, true
 }
 
-// entries is every entry under the servers' key, as the file has it.
+// entries is every entry under the servers' key, as the file has it: a
+// copy of what was parsed when the file last changed. Codex's config.toml
+// holds a [projects."<dir>"] table for every folder Codex was ever opened
+// in, ten thousand of them for some, and go-toml checks each table's name
+// against every one before it, so a parse of such a file was ~0.2s of CPU,
+// paid by every visit to the Library (#1665).
 func (f *mcpFile) entries() (map[string]map[string]any, error) {
-	out := map[string]map[string]any{}
 	if f.Format == fmtDsh {
 		return dshEntries(f.Path)
 	}
-	raw, err := edit.Read(f.Path)
-	if err != nil || len(bytes.TrimSpace(raw)) == 0 {
-		return out, err
+	kind := fmt.Sprintf("mcp entries %d %s", f.Format, f.key())
+	es, err := filememo.Read(kind, f.Path, f.parseEntries)
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string]map[string]any{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]any, len(es))
+	for name, m := range es {
+		out[name] = cloneAny(m).(map[string]any)
+	}
+	return out, nil
+}
+
+// entriesParsed counts parseEntries, for a test to see a file parsed once.
+var entriesParsed atomic.Int64
+
+// parseEntries is entries of the file's bytes.
+func (f *mcpFile) parseEntries(raw []byte) (map[string]map[string]any, error) {
+	entriesParsed.Add(1)
+	out := map[string]map[string]any{}
+	raw = edit.TrimBOM(raw)
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return out, nil
 	}
 	var doc map[string]any
+	var err error
 	switch f.Format {
 	case fmtCodex, fmtGrok:
 		err = toml.Unmarshal(raw, &doc)
@@ -803,6 +912,32 @@ func (f *mcpFile) entries() (map[string]map[string]any, error) {
 		}
 	}
 	return out, nil
+}
+
+// cloneAny is a deep copy of a parsed value, so a caller can change what
+// entries gives without changing what the next one gets.
+func cloneAny(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			out[k] = cloneAny(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = cloneAny(x)
+		}
+		return out
+	case []map[string]any:
+		out := make([]map[string]any, len(t))
+		for i, x := range t {
+			out[i] = cloneAny(x).(map[string]any)
+		}
+		return out
+	}
+	return v
 }
 
 // read is every server in the file, magpie's or not, by name.
@@ -898,6 +1033,8 @@ var owned = map[mcpFormat][]string{
 	// the flat shape's keys go when magpie writes the entry again
 	fmtCline:       {"transport", "type", "transportType", "url", "headers", "command", "args", "cwd", "env"},
 	fmtCommandCode: {"transport", "type", "url", "headers", "command", "args", "env"},
+	// enabled, remote, timeout and oauth are the user's
+	fmtZed: {"url", "headers", "command", "args", "env"},
 
 	// a url agy read in place of serverUrl goes when magpie writes one
 	fmtAntigravity: {"type", "serverUrl", "url", "headers", "command", "args", "env"},
@@ -981,7 +1118,11 @@ func (f *mcpFile) merged(s *Server, old map[string]any) ordered {
 
 // put writes the server into the file, in place of one by its name.
 func (f *mcpFile) put(s *Server, old map[string]any) error {
-	o := f.merged(s, old)
+	return f.putEntry(s, f.merged(s, old))
+}
+
+// putEntry writes the entry o for the server into the file.
+func (f *mcpFile) putEntry(s *Server, o ordered) error {
 	switch f.Format {
 	case fmtCodex, fmtGrok:
 		return putCodex(f.Path, s.Name, o)
@@ -1208,10 +1349,13 @@ func appOwned(s *Server) bool {
 	return false
 }
 
-func foundServers(l *Library) []Found {
+func foundServers(l *Library) []Found { return foundServersOf(l, Targets()) }
+
+// foundServersOf is foundServers among these agents.
+func foundServersOf(l *Library, targets []*Target) []Found {
 	byName := map[string]*Found{}
 	var names []string
-	for _, t := range Targets() {
+	for _, t := range targets {
 		if t.MCP == nil {
 			continue
 		}

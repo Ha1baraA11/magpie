@@ -33,6 +33,7 @@ import (
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -192,8 +193,17 @@ func grokSigned(acct *Account, home string) {
 			return err
 		}
 		grokHeaders(req, c.Key)
-		if m := bodyModel(body); m != "" {
+		if m, window := grokWindowed(bodyModel(body)); m != "" {
 			req.Header.Set("x-grok-model-override", m)
+			if window > 0 {
+				// grok-4.7@500k goes as grok-4.7 at that window, as the
+				// CLI's /context-window 500k sends it
+				req.Header.Set("x-grok-context-window", strconv.Itoa(window))
+				nb := withModel(body, m)
+				req.Body = io.NopCloser(bytes.NewReader(nb))
+				req.ContentLength = int64(len(nb))
+				req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(nb)), nil }
+			}
 		}
 		var v struct {
 			Key string `json:"prompt_cache_key"`
@@ -225,9 +235,12 @@ var grokTools = map[string]bool{"function": true, "web_search": true, "x_search"
 // A tool_choice with no tools
 // left goes too: the backend turns the request away over it ("A
 // tool_choice was set on the request but no tools were specified"), as it
-// would Codex's compaction summary, sent without tools (#378).
+// would Codex's compaction summary, sent without tools (#378). A Codex
+// agent_message (a subagent's task, or its reply in the lead's history),
+// which the backend turns away with 422 "unknown item type", goes as the
+// user's message, its sender and recipient said first (grokAgentMessage).
 func grokBody(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) {
+	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) && !bytes.Contains(body, []byte(`"agent_message"`)) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -281,7 +294,11 @@ func grokBody(body []byte) []byte {
 		}
 	}
 	input, _ := m["input"].([]any)
-	for _, it := range input {
+	for i, it := range input {
+		if msg, ok := grokAgentMessage(it); ok {
+			input[i], it = msg, msg
+			dirty = true
+		}
 		if im, ok := it.(map[string]any); ok && flatCall(im) {
 			dirty = true
 		}
@@ -300,6 +317,57 @@ func grokBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// grokAgentMessage is a plain Codex agent_message as the user's message
+// Grok's backend takes: "From <author> to <recipient>" first, then its text
+// and images as they came, in its place among the input. One sealed
+// (encrypted_content on it or on a part), empty, or with a part of another
+// kind is left as it is: magpie reads no sealed task, and the gateway's
+// guard for one (hasSealedAgentMessage) still sees it. The plugin does the
+// same (@magpie-community/opencode-grok-auth 0.1.11, plugins#61).
+func grokAgentMessage(it any) (map[string]any, bool) {
+	im, ok := it.(map[string]any)
+	if !ok || im["type"] != "agent_message" {
+		return nil, false
+	}
+	if _, sealed := im["encrypted_content"]; sealed {
+		return nil, false
+	}
+	parts, _ := im["content"].([]any)
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, p := range parts {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if _, sealed := pm["encrypted_content"]; sealed {
+			return nil, false
+		}
+		_, isText := pm["text"].(string)
+		_, isURL := pm["image_url"].(string)
+		if !(pm["type"] == "input_text" && isText || pm["type"] == "input_image" && isURL) {
+			return nil, false
+		}
+	}
+	from, _ := im["author"].(string)
+	to, _ := im["recipient"].(string)
+	header := ""
+	switch {
+	case from != "" && to != "":
+		header = "From " + from + " to " + to
+	case from != "":
+		header = "From " + from
+	case to != "":
+		header = "To " + to
+	}
+	content := parts
+	if header != "" {
+		content = append([]any{map[string]any{"type": "input_text", "text": header + "\n\n"}}, parts...)
+	}
+	return map[string]any{"type": "message", "role": "user", "content": content}, true
 }
 
 // liteNamespace is the namespace Codex's Responses Lite groups its own
@@ -617,6 +685,7 @@ func parseGrokModels(b []byte) []catalog.Model {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			Context int    `json:"context_window"`
+			Windows []int  `json:"context_windows"`
 			Backend string `json:"api_backend"`
 			Efforts []struct {
 				Value string `json:"value"`
@@ -641,9 +710,67 @@ func parseGrokModels(b []byte) []catalog.Model {
 				m.Efforts = append(m.Efforts, e)
 			}
 		}
-		ms = append(ms, m)
+		ms = append(ms, grokContextModels(m, d.Windows)...)
 	}
 	return ms
+}
+
+// grokContextModels is one model for each context window Grok lists it at
+// (#1608). context_window is the default and keeps the plain id
+// (grok-4.7), so a saved agent stays where it was; each other size in
+// context_windows is offered beside it (grok-4.7@500k), the way the CLI's
+// /context-window offers it, and asked for with x-grok-context-window
+// (grokWindowed). The same as the grok plugin's windowsOf (plugins#83).
+func grokContextModels(m catalog.Model, listed []int) []catalog.Model {
+	var windows []int
+	for _, w := range listed {
+		if w > 0 && !slices.Contains(windows, w) {
+			windows = append(windows, w)
+		}
+	}
+	if len(windows) == 0 {
+		return []catalog.Model{m}
+	}
+	if !slices.Contains(windows, m.Context) {
+		m.Context = windows[0]
+	}
+	out := []catalog.Model{m}
+	for _, w := range windows {
+		if w == m.Context {
+			continue
+		}
+		at := grokWindowLabel(w)
+		o := m
+		o.ID, o.Name, o.Context = m.ID+"@"+at, m.Name+" @ "+at, w
+		o.Efforts = slices.Clone(m.Efforts)
+		o.APIs = slices.Clone(m.APIs)
+		out = append(out, o)
+	}
+	return out
+}
+
+// grokWindowLabel is a window as an id names it: 500000 is "500k".
+func grokWindowLabel(n int) string {
+	if n%1000 == 0 {
+		return strconv.Itoa(n/1000) + "k"
+	}
+	return strconv.Itoa(n)
+}
+
+// grokWindowed splits a requested id into the model Grok lists and the
+// window the id names: grok-4.7 is grok-4.7 at its default window (0, no
+// header), grok-4.7@500k is grok-4.7 at 500000 tokens.
+func grokWindowed(id string) (string, int) {
+	model, size, ok := strings.Cut(id, "@")
+	if !ok {
+		return id, 0
+	}
+	k, ok := strings.CutSuffix(size, "k")
+	n, err := strconv.Atoi(k)
+	if !ok || err != nil || n <= 0 || model == "" {
+		return id, 0
+	}
+	return model, n * 1000
 }
 
 // grokRefreshMargin is how close to its expiry a borrowed token has the CLI
@@ -752,7 +879,7 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := proc.CommandContext(ctx, path, args...)
 	cmd.Dir, _ = os.UserHomeDir()
-	cmd.Env = netproxy.Env(env)
+	cmd.Env = netproxy.EnvWith(s.proxy, env)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()

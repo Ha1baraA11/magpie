@@ -46,6 +46,20 @@ const errRemoteNothingRead = "nothing read on that magpie yet; refresh to have i
 // errRemoteNoShare is a remote magpie too old to answer RemoteCardsPath.
 const errRemoteNoShare = "remote magpie doesn't share its quotas; update magpie on that computer"
 
+// errRemoteNotShared is a remote magpie that answers models but not its
+// quotas (403): it isn't shared on its local network, as an older magpie's
+// gateway that MAGPIE_ADDR opened (Docker's) wasn't until it was (Fim980 on
+// X: the card said only "Allowance unavailable"). A newer one asks a key of
+// every other machine and, given one, answers the quotas too.
+const errRemoteNotShared = "remote magpie isn't shared; turn on Share on local network on that computer"
+
+// errRemoteKey is a remote magpie that didn't take this provider's key (401).
+const errRemoteKey = "remote magpie didn't take this key; use one of its enabled gateway keys"
+
+// errRemoteUnreachable starts the error of a remote magpie that couldn't
+// be reached at all.
+const errRemoteUnreachable = "couldn't reach the remote magpie"
+
 // CachedCards is the Usage page's cards as this magpie last read them,
 // each with its kind, for another magpie to show: no vendor is asked,
 // whatever their age, and another magpie's cards shown here aren't
@@ -79,11 +93,13 @@ func CachedCards(now time.Time) []SubscriptionQuota {
 		}
 	}
 	plans, balances = withKeyReadings(plans, ps, "plan"), withKeyReadings(balances, ps, "balance")
+	plans, subs = seatCards(plans, subs)
+	subs = withAccountNames(subs)
 	out := []SubscriptionQuota{}
 	for _, g := range []struct {
 		kind string
 		qs   []SubscriptionQuota
-	}{{"subscription", subs}, {"plan", notShown(plans, subs)}, {"balance", balances}} {
+	}{{"subscription", subs}, {"plan", plans}, {"balance", balances}} {
 		for _, q := range g.qs {
 			if q.From == "" {
 				q.Kind = g.kind
@@ -100,7 +116,7 @@ func ReadAllCards(ctx context.Context) {
 	AskUsage()
 	ForgetBalances()
 	forgetPlanQuotas()
-	Quotas(ctx)
+	Quotas(Asked(ctx))
 }
 
 var remoteCardCache struct {
@@ -121,6 +137,10 @@ func ForgetRemoteCardsForTest() {
 	c.Lock()
 	c.m = nil
 	c.Unlock()
+	k := &remoteKeyCache
+	k.Lock()
+	k.m = nil
+	k.Unlock()
 }
 
 // ForgetKeptCardsForTest has the cards kept on disk (quotas.json) read
@@ -150,7 +170,13 @@ func RemoteCards(ctx context.Context) []SubscriptionQuota {
 	var wg sync.WaitGroup
 	for i, p := range ps {
 		wg.Add(1)
-		go func() { defer wg.Done(); got[i] = remoteCards(ctx, p, false) }()
+		go func() {
+			defer wg.Done()
+			// its keys' own limits (#1547), read beside its cards
+			keys := make(chan []SubscriptionQuota, 1)
+			go func() { keys <- remoteKeyCards(ctx, p, false, "") }()
+			got[i] = append(remoteCards(ctx, p, false), <-keys...)
+		}()
 	}
 	wg.Wait()
 	return slices.Concat(got...)
@@ -235,6 +261,11 @@ func IsRemoteCard(id string) bool {
 // refreshRemote has the remote magpie read its card again (every card,
 // for the remote's own), then keeps what it now has.
 func refreshRemote(ctx context.Context, p Provider, card, user string) {
+	// a key's limit card is read again with that key (or every key's)
+	if card == remoteKeyCard {
+		remoteKeyCards(ctx, p, true, user)
+		return
+	}
 	q := url.Values{}
 	if card != "" {
 		q.Set("provider", card)
@@ -303,13 +334,17 @@ func remoteJSON(ctx context.Context, p Provider, method, path string, dst any) e
 	req.Header.Set("Accept", "application/json")
 	res, err := p.Do(http.DefaultClient, req)
 	if err != nil {
-		return fmt.Errorf("couldn't reach %s: %w", remoteName(p), err)
+		return fmt.Errorf("%s %s: %w", errRemoteUnreachable, remoteName(p), err)
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 8<<20))
 	switch {
 	case res.StatusCode == http.StatusNotFound || res.StatusCode == http.StatusMethodNotAllowed:
 		return fmt.Errorf("%s", errRemoteNoShare)
+	case res.StatusCode == http.StatusForbidden:
+		return fmt.Errorf("%s", errRemoteNotShared)
+	case res.StatusCode == http.StatusUnauthorized:
+		return fmt.Errorf("%s", errRemoteKey)
 	case res.StatusCode < 200 || res.StatusCode >= 300:
 		var e struct {
 			Error struct {

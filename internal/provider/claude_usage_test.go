@@ -18,8 +18,11 @@ import (
 func fakeClaudeUsage(t *testing.T, out *atomic.Value, fail *atomic.Bool) *atomic.Int32 {
 	t.Helper()
 	var runs atomic.Int32
-	old, oldAsked := claudeCLIUsage, claudeAsked.Load()
-	UsageClaudeVia(func(context.Context) (string, error) {
+	claudeCLIUsage.RLock()
+	old := claudeCLIUsage.f
+	claudeCLIUsage.RUnlock()
+	oldAsked := claudeAsked.Load()
+	UsageClaudeVia(func(context.Context, string) (string, error) {
 		runs.Add(1)
 		if fail != nil && fail.Load() {
 			return "", errors.New("Claude Code: network is unreachable")
@@ -38,7 +41,8 @@ func fakeClaudeUsage(t *testing.T, out *atomic.Value, fail *atomic.Bool) *atomic
 	claudeUsage.m = nil
 	claudeUsage.Unlock()
 	t.Cleanup(func() {
-		claudeCLIUsage, claudeBase, claudeUsageWait, claudeUsedSince = old, oldBase, oldWait, oldUsed
+		UsageClaudeVia(old)
+		claudeBase, claudeUsageWait, claudeUsedSince = oldBase, oldWait, oldUsed
 		claudeAsked.Store(oldAsked)
 		srv.Close()
 		claudeUsage.Lock()
