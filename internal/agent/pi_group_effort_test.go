@@ -15,9 +15,9 @@ import (
 // Plan's deepseek-v4-pro-202606 that nothing magpie reads knows) was
 // written the group without reasoning, so its /thinking offered off alone,
 // while magpie's thinking field offered every level and showed max — which
-// Pi clamped to off, sending no reasoning_effort. The group now has its
-// known member's levels, Pi's entry offers them, and magpie's field offers
-// what Pi offers for the model and shows the level Pi runs it at.
+// Pi clamped to off, sending no reasoning_effort. The group now gets the
+// levels verified for TokenHub's model, so Pi and magpie offer the same
+// levels instead of borrowing DeepSeek's unverified off level.
 func TestPiGroupThinkingIsWhatPiRuns(t *testing.T) {
 	home := syncHome(t)
 	if err := os.WriteFile(catalog.CachePath(), []byte(`{
@@ -62,7 +62,7 @@ func TestPiGroupThinkingIsWhatPiRuns(t *testing.T) {
 	if entry == nil || entry["reasoning"] != true {
 		t.Fatalf("group entry: %v", entry)
 	}
-	if got := piSupported(entry); !reflect.DeepEqual(got, []string{"off", "low", "high", "max"}) {
+	if got := piSupported(entry); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
 		t.Fatalf("Pi offers %v for the group: %v", got, entry["thinkingLevelMap"])
 	}
 
@@ -74,7 +74,7 @@ func TestPiGroupThinkingIsWhatPiRuns(t *testing.T) {
 		return out
 	}
 	effort := a.Field("effort")
-	if got := values(effort.Options(map[string]string{"model": "magpie/group/deepseek"})); !reflect.DeepEqual(got, []string{"off", "low", "high", "max"}) {
+	if got := values(effort.Options(map[string]string{"model": "magpie/group/deepseek"})); !reflect.DeepEqual(got, []string{"low", "high", "max"}) {
 		t.Fatalf("offered %v", got)
 	}
 	if got := effort.Get(); got != "max" {

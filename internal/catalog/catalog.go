@@ -502,7 +502,11 @@ func load() map[string]mdProvider {
 							}
 							named[who][x.Name]++
 						}
-						if e := x.efforts(by); len(e) > 0 {
+						// This vote answers what the catalog lists for the
+						// model across providers. A verified provider's toggle
+						// support is applied only when that provider itself is
+						// queried; it must not leak into relays or aggregates.
+						if e := x.efforts(""); len(e) > 0 {
 							l := strings.Join(e, ",")
 							if levels[who] == nil {
 								levels[who] = map[string]int{}
@@ -512,7 +516,7 @@ func load() map[string]mdProvider {
 								levels[who][l]++
 							}
 						}
-						if x.Thinks || len(x.efforts(by)) > 0 {
+						if x.Thinks || len(x.efforts("")) > 0 {
 							reasons[who]++
 						} else {
 							reasons[who]--
@@ -1064,6 +1068,18 @@ func unmarked(b string) (string, int) {
 // lists mimo-v2.6-flash with a switch alone, where gateways reselling it
 // give levels up to max, which Xiaomi turns away (#214).
 func ListedBy(providers []string, id string) ([]string, bool) {
+	return listedBy(providers, id, true)
+}
+
+// ListedByBorrowed is ListedBy for levels borrowed from another provider:
+// it uses the levels the catalog lists, without adding a verified provider's
+// toggle-only off level. A provider's API accepting "none" does not verify
+// that a relay, reseller, or another provider does too.
+func ListedByBorrowed(providers []string, id string) ([]string, bool) {
+	return listedBy(providers, id, false)
+}
+
+func listedBy(providers []string, id string, providerOverrides bool) ([]string, bool) {
 	all := load()
 	b := bareID(id)
 	if r, _, ok := renamed(b); ok {
@@ -1078,7 +1094,11 @@ func ListedBy(providers []string, id string) ([]string, bool) {
 				if bareID(key) != want {
 					continue
 				}
-				if e := all[pid].levels(m, pid); len(e) > 0 || !m.budgeted() {
+				providerID := ""
+				if providerOverrides {
+					providerID = pid
+				}
+				if e := all[pid].levels(m, providerID); len(e) > 0 || !m.budgeted() {
 					return slices.Clone(e), true
 				}
 			}
@@ -1105,7 +1125,7 @@ func KinEfforts(providers []string, id string) ([]string, bool) {
 	)
 	for _, pid := range providers {
 		for key, m := range all[pid].Models {
-			if !m.Thinks && len(m.efforts(pid)) == 0 || m.budgeted() {
+			if !m.Thinks && len(m.efforts("")) == 0 || m.budgeted() {
 				continue
 			}
 			if s, ok := versionless(bareID(key)); !ok || s != shape {
@@ -1114,7 +1134,7 @@ func KinEfforts(providers []string, id string) ([]string, bool) {
 			// the newest; of two the same day, the first provider's, then
 			// the greater id, whatever order the map gives
 			if !found || m.ReleaseDate > newest || m.ReleaseDate == newest && pid == from && key > name {
-				levels, newest, from, name, found = all[pid].levels(m, pid), m.ReleaseDate, pid, key, true
+				levels, newest, from, name, found = all[pid].levels(m, ""), m.ReleaseDate, pid, key, true
 			}
 		}
 	}

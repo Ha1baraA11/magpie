@@ -109,6 +109,17 @@ func TestToggleAddsOffLevelForVerifiedProviders(t *testing.T) {
 	if got := strings.Join(EffortsOf("deepseek-flash"), ","); got != "low,high,max" {
 		t.Errorf("EffortsOf(%q) = %q, want low,high,max", "deepseek-flash", got)
 	}
+	for _, id := range []string{"k3", "kimi-for-coding"} {
+		if got := strings.Join(EffortsOf(id), ","); got != "low,high,max" {
+			t.Errorf("EffortsOf(%q) = %q, want low,high,max", id, got)
+		}
+	}
+	if got, ok := ListedByBorrowed([]string{"deepseek"}, "deepseek-v4-pro"); !ok || strings.Join(got, ",") != "low,high,max" {
+		t.Errorf("ListedByBorrowed(%q) = %v, %v; want low,high,max, true", "deepseek-v4-pro", got, ok)
+	}
+	if got, ok := KinEfforts([]string{"deepseek"}, "deepseek-v5-flash-vision-exp"); !ok || strings.Join(got, ",") != "low,high,max" {
+		t.Errorf("KinEfforts(%q) = %v, %v; want low,high,max, true", "deepseek-v5-flash-vision-exp", got, ok)
+	}
 
 	for _, tc := range []struct {
 		provider string
