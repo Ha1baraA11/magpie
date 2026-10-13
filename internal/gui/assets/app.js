@@ -188,6 +188,7 @@ const CROSS = "M4.5 4.5l7 7M11.5 4.5l-7 7";
 const PLUS = "M8 3.5v9M3.5 8h9";
 const OUT = "M6.5 3.5h-3v9h9v-3M9 3.5h3.5V7M12.5 3.5 7.5 8.5";
 const COPY_ICON = "M5.5 5.5V3.5h7v7h-2M3.5 5.5h7v7h-7z";
+const PENCIL = "M3.5 12.5l.5-2.5 6.8-6.8a1.2 1.2 0 0 1 1.7 0l.3.3a1.2 1.2 0 0 1 0 1.7L6 12z M9.8 4.2l2 2";
 const PUZZLE = "M6.2 2.8h2.3a1.3 1.3 0 1 1 2.5 0h2.2V5a1.3 1.3 0 1 0 0 2.6v5.6H3V7.6a1.3 1.3 0 1 1 0-2.6V2.8z";
 
 // A brand icon: colour logos are images, mono logos take the text colour.
@@ -1724,13 +1725,15 @@ function daemonRestart() {
 // connectPanel: a connected agent's row, opened
 function connectPanel(a, { fields, fieldBtn }) {
   const box = el("div", "ag-exp");
+  const settings = el("div", "ag-settings");
+  box.append(settings);
   box.onclick = (e) => e.stopPropagation();
   const kv = (k, ...v) => {
     const r = el("div", "ag-kv");
     const val = el("div", "ag-v");
     val.append(...v);
     r.append(el("div", "ag-k", k), val);
-    box.append(r);
+    settings.append(r);
     return val;
   };
   const line = (...parts) => {
@@ -13548,6 +13551,33 @@ function renderKeyAccounts(p) {
     };
     row.append(dot, name);
     if (k.name) row.append(el("span", "plan mono", k.masked));
+    // a key rotated at the vendor (#1869): its new value pasted in place,
+    // keeping its name, place and settings; a rest it had is lifted
+    const edit = el("button", "key-edit");
+    edit.title = t("Paste a new value for this key; its name, place and settings stay");
+    edit.setAttribute("aria-label", t("Change key"));
+    edit.append(svg(PENCIL, 12, 1.4));
+    edit.onclick = (e) => {
+      e.stopPropagation();
+      if (row.querySelector(".key-value-in")) return;
+      const i = input("", t("Paste the key's new value"), "password");
+      i.className = "rename-in key-value-in";
+      let over = false;
+      const done = (save) => {
+        if (over) return;
+        over = true;
+        if (save && i.value.trim()) accountAction("keys/replace", { id: p.id, ref: k.id, key: i.value }, t("{key} now uses its new value", { key: k.name || k.masked }));
+        else renderProviders();
+      };
+      i.onkeydown = (ev) => { ev.stopPropagation(); if (ev.key === "Enter") done(true); else if (ev.key === "Escape") done(false); };
+      i.onblur = () => done(!!i.value.trim());
+      const shown = row.querySelector(".plan.mono");
+      if (shown) shown.replaceWith(i);
+      else name.after(i);
+      i.focus({ preventScroll: true });
+    };
+    // a double-click on the row is the shortcut, away from its controls
+    row.ondblclick = (e) => { if (!e.target.closest("button, input, textarea, .acct-models")) edit.onclick(e); };
     // each key copies its own (#1480): with several, the editor has no
     // API key field to show one in
     const cp = el("button", "copy");
@@ -13557,16 +13587,43 @@ function renderKeyAccounts(p) {
       e.stopPropagation();
       try { copy((await api("provider/key", { id: p.id, account: k.id })).key, k.name || k.masked, cp); } catch (err) { status(err.message, "err"); }
     };
-    row.append(cp);
-    // one the gateway passes over after a failure: why, and until when
+    row.append(cp, edit);
+    // one the gateway passes over after a failure: why, and until when, on
+    // a line of its own under the key's, so the row's controls stay in reach
+    let restLine = null;
     if (k.rest && new Date(k.rest.until) > Date.now()) {
       const r = el("span", "key-rest", t("Resting · {why} · back at {time}", { why: (k.rest.status ? k.rest.status + " " : "") + t(KEY_FAIL[k.rest.why] || "failed"), time: new Date(k.rest.until).toLocaleTimeString(intlLang(), { hour: "2-digit", minute: "2-digit" }) }));
       r.title = t("The gateway passes this key over until then, and tries the next one");
-      row.append(r);
+      // lifted by hand (#1869): the next request asks it again, and a
+      // refusal then rests it again as before
+      const go = el("button", "text key-unrest", t("Try now"));
+      go.title = t("Ends the rest: the next request asks it again. Refused again, it rests again.");
+      go.onclick = async (e) => {
+        e.stopPropagation();
+        go.classList.add("busy");
+        try {
+          await api("gateway/unrest", { key: k.rest.key });
+          k.rest = null;
+          renderProviders();
+          status(t("{key} is asked again from the next request", { key: k.name || k.masked }), "ok");
+        } catch (err) { go.classList.remove("busy"); status(err.message, "err"); }
+      };
+      restLine = el("div", "key-rest-line");
+      restLine.append(r, go);
+      row.classList.add("resting");
     }
     if (k.on && several) row.append(keyWeight(p, k, weightOf(k), weights));
     const proto = protoPicker(p, k.protocol, (v) => accountAction("keys/protocol", { id: p.id, ref: k.id, protocol: v }));
     if (proto) row.append(proto);
+    // set to a protocol the provider has no URL for (#1702): the gateway
+    // can't send it there, so the row says so rather than the request
+    // quietly going out on another URL
+    const lacks = keyLacksURL(p, k);
+    if (lacks) {
+      const n = el("span", "key-nourl", t("No {api} URL", { api: lacks }));
+      n.title = t("This key is set to {api} only, but {name} has no {api} URL, so no request reaches {api} with it. Fill in the {api} URL, or set the key to Any protocol.", { api: lacks, name: p.name });
+      row.append(n);
+    }
     // its own models (#474), when there is another key to send the rest to
     const [amPill, amBox] = p.keyList.length > 1 || accountModelsOf(p, k.id).length ? accountModels(p, k.id, true, k.name || k.masked) : [];
     if (amPill) row.append(amPill);
@@ -13584,6 +13641,7 @@ function renderKeyAccounts(p) {
       first.onclick = () => { first.classList.add("busy"); accountAction("keys/use", { id: p.id, ref: k.id }, t("{name} tries {key} first", { name: p.name, key: k.name || k.masked })); };
       row.append(first);
     }
+    if (restLine) row.append(restLine);
     if (amBox) row.append(amBox), row.classList.add("with-am");
     list.append(row);
   }
@@ -13814,6 +13872,13 @@ const PROTO_OPTS = [
   { v: "chat", pill: "Chat", name: "Chat Completions", note: "OpenAI API · GPT models, most agents" },
   { v: "responses", pill: "Responses", name: "Responses", note: "OpenAI Responses API · Codex" },
 ];
+
+// keyLacksURL is the protocol a key is set to when its provider has no URL
+// for it (the pill's own name), else "".
+function keyLacksURL(p, k) {
+  if (!["anthropic", "chat", "responses"].includes(k.protocol) || p[k.protocol]) return "";
+  return t(PROTO_OPTS.find((o) => o.v === k.protocol).pill);
+}
 
 // protoPicker is the key row's protocol badge; clicking it drops a small menu
 // that says what each choice is for.
@@ -17588,36 +17653,40 @@ const ledSpeed = (x) => x?.decode_ms > 0 ? (1000 * x.decode_out) / x.decode_ms :
 const ledFloor = (x) => x?.floor_ms > 0 ? (1000 * x.floor_out) / x.floor_ms : 0;
 // a group's speed as every ranking and the Output speed card say it, by one
 // rule (Fallmonkey on Discord): with replies whose speed was measured, their
-// speed and how many they are, "125 tok/s (1)", not beside "260 requests"
-// alone; with replies read from a session file that tell the least they
-// wrote at, that floor and how many, "≥100 tok/s (30)"; with both, both,
-// the measured first, "62 tok/s (2) · ≥71 tok/s (54)", as two replies are
-// too few to stand for 56 and a floor is no measure; else nothing. The
-// Requests tab says the same of each row: "125 tok/s" or "≥100 tok/s". v is
-// the figure a speed ranking orders by and bars: the measured speed when
-// there is one, else the floor. main is the first part, floor the second.
+// speed and how many they are, "125 tok/s · 1 timed reply", not beside "260
+// requests" alone; with replies read from a session file that tell the least
+// they wrote at, that floor and how many, "≥100 tok/s · 30 replies"; with
+// both, both, the one of more replies first, "≥71 tok/s · 54 replies; 62
+// tok/s · 2 timed replies", as two replies are too few to stand for 56; else
+// nothing. Counts are words, not a bare "(2)" only its tooltip explains. The
+// Requests tab says each row's alone: "125 tok/s" or "≥100 tok/s". v is the
+// figure a speed ranking orders by and bars, the first one's; main is the
+// first, other the second ("" with one).
 function ledGroupSpeed(x) {
   const v = ledSpeed(x), f = ledFloor(x), kv = x?.decode_n || 0, kf = x?.floor_n || 0;
   if (!v && !f) return null;
-  const say = (s, k) => k ? t("{n} tok/s ({k})", { n: ledNum(Math.round(s)), k: ledNum(k) }) : t("{n} tok/s", { n: ledNum(Math.round(s)) });
-  const measured = v ? say(v, kv) : "", floor = f ? "≥" + say(f, kf) : "";
+  const tok = (s) => t("{n} tok/s", { n: ledNum(Math.round(s)) });
+  const count = (k, timed) => !k ? "" : t(timed ? (k === 1 ? "{k} timed reply" : "{k} timed replies") : (k === 1 ? "{k} reply" : "{k} replies"), { k: ledNum(k) });
   const vTitle = !v || !kv ? "" : f ? t(kv === 1 ? "Measured on {k} reply, from its first token to its end" : "Measured on {k} replies, from their first token to their end", { k: ledNum(kv) })
     : t(kv === 1 ? "Measured on {k} reply, from its first token to its end; the others tell no speed" : "Measured on {k} replies, from their first token to their end; the others tell no speed", { k: ledNum(kv) });
   const fTitle = !f || !kf ? "" : t(kf === 1 ? "At least: {k} reply read from a session file, which doesn't say when its answer began, so time before that is counted too" : "At least: {k} replies read from session files, which don't say when their answers began, so time before that is counted too", { k: ledNum(kf) });
-  // main's parts: the speed and the replies it is of, so a narrow card can
-  // put the second under the first rather than run past its edge (#1623)
-  const parts = (s, k, pre) => {
-    const whole = pre + say(s, k), head = pre + t("{n} tok/s", { n: ledNum(Math.round(s)) });
-    return k && whole.startsWith(head) && whole.length > head.length ? [head, whole.slice(head.length)] : [whole];
-  };
-  return { v: v || f, text: [measured, floor].filter(Boolean).join(" · "), main: measured || floor, mainParts: v ? parts(v, kv, "") : parts(f, kf, "≥"), floor: measured ? floor : "", title: [vTitle, fTitle].filter(Boolean).join("\n") };
+  // each figure as its speed and its count, kept apart so a narrow card can
+  // put the count under the speed rather than run past its edge (#1623); the
+  // card sets the count as a caption, with no "·" to lead a wrapped line
+  const measured = v ? { s: v, head: tok(v), count: count(kv, true), title: vTitle } : null;
+  const floor = f ? { s: f, head: "≥" + tok(f), count: count(kf, false), title: fTitle } : null;
+  // the larger sample first; a tie keeps the measured one first
+  const [a, b] = measured && floor && kf > kv ? [floor, measured] : [measured || floor, measured && floor];
+  const say = (p) => p.count ? p.head + " · " + p.count : p.head;
+  const main = say(a), other = b ? say(b) : "";
+  return { v: a.s, text: other ? t("{a}; {b}", { a: main, b: other }) : main, main, mainParts: a.count ? [a.head, " " + a.count] : [a.head], other, title: [a.title, b?.title].filter(Boolean).join("\n") };
 }
 // their mean wait for the first token, 0 for none
 const ledTTFT = (x) => x?.timed > 0 ? x.ttft_ms / x.timed : 0;
 // a metric's value of a point or a share, as the chart counts it
 const ledValue = (m, x) => m === "speed" ? ledSpeed(x) : m === "cost" ? +x.cost || 0 : m === "calls" ? +x.calls || 0 : allTokens(x);
-// of a share in the ranking: a speed is what its row says, the floor of a
-// group none of whose replies was measured (ledGroupSpeed)
+// of a share in the ranking: a speed is what its row says first, the one of
+// more replies (ledGroupSpeed)
 const ledRankValue = (m, x) => m === "speed" ? ledGroupSpeed(x)?.v || 0 : ledValue(m, x);
 // of a point's part, which has its calls, tokens, cost and speed
 const ledPart = (m, x) => m === "speed" ? ledSpeed(x) : m === "cost" ? +x.cost || 0 : m === "calls" ? +x.calls || 0 : +x.tokens || 0;
@@ -17993,12 +18062,15 @@ function renderLedgerDash(l) {
   fill.style.width = (100 * rate).toFixed(1) + "%";
   meter.append(fill);
   hit.append(meter);
-  // how fast the streamed replies wrote, and how long they took to begin (#860)
-  // a floor beside a measured speed goes under it, the card's figure kept whole
+  // how fast the streamed replies wrote, and how long they took to begin (#860):
+  // the figure of more replies, its count beside it; the other under it; the
+  // wait for the first token on a line of its own, with how many it is of
+  // (Fallmonkey on Discord)
   const gs = ledGroupSpeed(l);
-  block("Output speed", gs ? gs.mainParts : "—",
-    line(...[ledTTFT(l) ? t("first token in {ms} on average", { ms: ledTook(ledTTFT(l)) }) : t("no streamed replies timed")].concat(gs?.floor ? [" · ", gs.floor] : [])),
-    "", [gs?.title, t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it")].filter(Boolean).join("\n"));
+  const ttft = ledTTFT(l) ? t("first token in {ms} on average", { ms: ledTook(ledTTFT(l)) }) + " · " + t(l.timed === 1 ? "{k} timed reply" : "{k} timed replies", { k: ledNum(l.timed) }) : t("no streamed replies timed");
+  const speedCard = block("Output speed", gs ? gs.mainParts : "—", gs?.other ? line(gs.other) : null,
+    "", [gs?.title, t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed")].filter(Boolean).join("\n"));
+  speedCard.append(Object.assign(line(ttft), { className: "sub ttft" }));
   drawLedTrend();
 }
 
@@ -18274,12 +18346,13 @@ const LED_COLS = [
 // Discord): its content came in under a quarter of its window (flow_ms),
 // or its answer at over 20 times the pace its reasoning came before it
 const ledDecode = (r) => {
-  if (ledFailed_(r) || !(r.ttft_ms > 0)) return null;
-  const think = r.reasoning > 0, n = think ? r.out - r.reasoning : r.out, from = think ? r.first_text_ms : r.ttft_ms;
+  if (ledFailed_(r) || r.reasoning_hidden && !(r.first_text_ms > 0) || !(r.ttft_ms > 0)) return null;
+  const think = r.reasoning > 0, visible = think && !(r.first_text_ms > 0) && r.first_reasoning_ms >= r.ttft_ms && r.flow_ms > 0 && r.reasoning <= r.out;
+  const n = think && !visible ? r.out - r.reasoning : r.out, from = visible ? r.first_reasoning_ms : think ? r.first_text_ms : r.ttft_ms;
   const w = r.ms - from;
   if (!(n > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
   if (r.flow_ms > 0 && r.flow_ms * 4 < w) return null;
-  if (think && n * (r.first_text_ms - r.ttft_ms) > 20 * r.reasoning * w) return null;
+  if (think && r.first_text_ms > 0 && n * (r.first_text_ms - r.ttft_ms) > 20 * r.reasoning * w) return null;
   return { n, w };
 };
 // how fast a reply wrote, in tokens a second: 0 when it can't tell
@@ -18408,14 +18481,14 @@ function renderLedger() {
   // are counted with the pick cleared (usage.RequestPage), so all three stay
   // switchable whichever is on.
   const via = $("#ledVia");
-  const thru = l.through || { calls: 0 }, dir = l.direct || { calls: 0 };
-  if (thru.calls + dir.calls > 0) {
+  const thru = l.through || { calls: 0 }, dir = l.direct || { calls: 0 }, rep = l.reported || { calls: 0 };
+  if (thru.calls + dir.calls + rep.calls > 0) {
     // the total is the two sources added up, not the page's own totals: those
     // are the rows the filter keeps, so with one source picked the total cell
     // would read that one's figures under the whole period's count
     const all = {};
     for (const k of ["calls", "errors", "input", "output", "cache_read", "cache_write", "cost", "timed", "ttft_ms", "decode_ms", "decode_out"]) {
-      all[k] = (thru[k] || 0) + (dir[k] || 0);
+      all[k] = (thru[k] || 0) + (dir[k] || 0) + (rep[k] || 0);
     }
     const tile = (b, label, calls, tot, pick) => {
       const on = ledVia === pick;
@@ -18437,16 +18510,22 @@ function renderLedger() {
       };
       return b;
     };
-    // the three cells are the same elements from one redraw to the next, so
+    // the calls apps reported themselves (#1874) are a fourth cell, once
+    // there are some, or while they are the ones picked
+    const n = rep.calls > 0 || ledVia === "reported" ? 4 : 3;
+    // the cells are the same elements from one redraw to the next, so
     // one being pressed or focused is never swapped out from under a reader
     let cells = [...via.children];
-    if (cells.length !== 3) {
-      cells = [el("button"), el("button"), el("button")];
+    if (cells.length !== n) {
+      cells = cells.slice(0, n);
+      while (cells.length < n) cells.push(el("button"));
       via.replaceChildren(...cells);
     }
-    tile(cells[0], "all requests", thru.calls + dir.calls, all, "");
+    via.style.setProperty("--vias", String(n));
+    tile(cells[0], "all requests", thru.calls + dir.calls + rep.calls, all, "");
     tile(cells[1], "through magpie", thru.calls, thru, "through");
     tile(cells[2], "not through magpie", dir.calls, dir, "direct");
+    if (n === 4) tile(cells[3], "reported by apps", rep.calls, rep, "reported");
     via.hidden = false;
   } else {
     via.replaceChildren();
@@ -18551,6 +18630,12 @@ function renderLedger() {
         : t("Read from the agent's session file. The account is shown only when local metadata identifies it; no service provider is inferred.");
       badges.append(k);
     }
+    // a call an app reported itself (#1874): it went straight to its vendor
+    if (r.source === "reported") {
+      const k = el("span", "src reported", t("Reported"));
+      k.title = t("Reported by the app that made it, through POST /v1/magpie/usage/requests: the call went straight to its vendor, not through magpie.");
+      badges.append(k);
+    }
     if (badges.childElementCount) wc.append(badges);
     // the model sent is what the gateway sent the vendor: a session file has none
     // The log names a model, but does not capture the outbound HTTP request.
@@ -18577,8 +18662,8 @@ function renderLedger() {
     // how fast it wrote once it began, as CC Switch's log has it (#860)
     const v = ledRowSpeed(r), floor = ledFloorSpeed(r);
     td(v ? t("{n} tok/s", { n: ledNum(Math.round(v)) }) : floor ? "≥" + t("{n} tok/s", { n: ledNum(Math.round(floor)) }) : "—", "n speed" + (v || floor ? "" : " faint"),
-      v ? (r.reasoning > 0 ? t("{n} answer tokens in {ms} after the first text, the {r} reasoning tokens before it left out", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w), r: ledNum(r.reasoning) })
-        : t("{n} output tokens in {ms} after the first", { n: ledNum(r.out), ms: ledTook(r.ms - r.ttft_ms) })) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
+      v ? (r.reasoning > 0 && r.first_text_ms > 0 ? t("{n} answer tokens in {ms} after the first text, the {r} reasoning tokens before it left out", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w), r: ledNum(r.reasoning) })
+        : t("{n} output tokens in {ms} after the first", { n: ledNum(ledDecode(r).n), ms: ledTook(ledDecode(r).w) })) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
         : floor && ledFloor_(r).answer ? t("At least: {n} answer tokens in {ms} after the first token, the {r} reasoning tokens left out. The session file has no first text, so reasoning after the first token is counted too", { n: ledNum(ledFloor_(r).n), ms: ledTook(ledFloor_(r).w), r: ledNum(r.reasoning) }) + " · " + t("TTFT {ms}", { ms: ledTook(r.ttft_ms) })
         : floor ? t("At least: {n} output tokens in {ms}, from the line that asked for it to its last. The session file has no first token, so the wait for it is counted too", { n: ledNum(r.out), ms: ledTook(r.ms) })
         : r.ttft_ms || untimed || ledFailed_(r) ? "" : timed ? t("The session file has no first token to time a speed from") : t("Not streamed: no first token to time a speed from"));
@@ -19272,6 +19357,19 @@ function renderSessions() {
     stats.classList.add("empty");
     const filtered = sessAgent !== "all" || sessModel || sessFolder || q;
     stats.append(el("div", "none", !all.length && !rows.length ? t("No sessions yet. Claude Code's, Codex's, OpenCode's and Pi's sessions on this computer show up here, with what each cost and the command that resumes it.") : filtered ? t("No session matches.") : t("Nothing in this range.")));
+    if (from && all.some((s) => byAgent(s) && byFolder(s) &&
+      (!sessModel || s.models.some((m) => m.model === sessModel)) &&
+      (!q || [s.title, s.cwd, s.id, s.name, ...s.models.map((m) => m.model)].some((x) => (x || "").toLowerCase().includes(q))))) {
+      stats.firstChild.textContent = t("No sessions in this range");
+      const history = el("button", "text sess-show-history", t("All sessions"));
+      history.onclick = () => {
+        sessRange = "all";
+        try { localStorage.setItem("magpie.sessRange", sessRange); } catch {}
+        sessStats = null;
+        loadSessions().catch((e) => status(e.message, "err"));
+      };
+      stats.append(history);
+    }
     box.hidden = true;
     chart.hidden = true;
     grid.hidden = true;
@@ -20732,6 +20830,7 @@ function renderSettings() {
   renderImages(s, keep);
   renderSearch(s, keep);
   renderReplies(s, keep);
+  renderDisabledModels(s);
   renderRedact(s, keep);
   renderDiscovery(s);
   renderOTel(s, keep);
@@ -21438,7 +21537,13 @@ function renderTrayUsage(s, keep) {
     pill.classList.remove("busy");
     paint();
     if (!pill.isConnected) return;
-    const cards = (quotas || []).filter((q) => !q.error && (q.windows?.length || q.balance));
+    // the Usage page's cards (keyCards): a key's plan and its balance are
+    // one, not two rows of one name ticked together (#1658, MizuIro-H). A
+    // balance left a card of its own (a stale stand-in) whose id another
+    // row has already is left out: the menu bar shows the first card of an
+    // id, so its row could only tick the other.
+    const cards = keyCards((quotas || []).filter((q) => !q.error && (q.windows?.length || q.balance)))
+      .filter((q, i, all) => all.findIndex((c) => trayCardID(c) === trayCardID(q)) === i);
     const opts = [{ v: "", name: "Off", note: "" }];
     for (const q of cards) {
       // a subscription with several accounts: the one in use, whichever
@@ -22172,6 +22277,59 @@ function renderReplies(s, keep) {
     (v) => savePrefs({ ...keep, noLoopGuard: v === "off" })));
   l.append(lwho, lval);
   box.append(r, l);
+}
+
+// renderDisabledModels: the models the user turned off for every request
+// through magpie (#1867). Each pattern is a row with what it matches now and
+// Enable; Disable a model picks one from the list, or takes what is typed
+// (a glob such as *fable*). A disabled model is left out of magpie's lists
+// and refused by the gateway, so nothing reaches it through magpie; an agent
+// signed in to the vendor itself isn't covered, which the row says.
+function renderDisabledModels(s) {
+  const box = $("#disabledModelsList");
+  if (!box) return;
+  const list = s.disabledModels || [];
+  const save = (next) => writingPrefs(api("settings/disabled-models", { models: next }))
+    .then((ns) => { prefs = ns; renderSettings(); })
+    .catch((e) => { status(t(e.message), "err"); renderSettings(); });
+  const add = el("div", "row pref");
+  add.id = "disabledAddRow";
+  const who = el("div", "who");
+  who.append(el("div", "name", t("Disable a model")),
+    el("div", "sub wraps", t("A disabled model is refused on every route through magpie (a request, a session, a routing group, a fallback, a sub-agent, a decision model) and left out of magpie's lists and agents' pickers. Only requests through magpie are covered. Type a pattern such as *fable* to disable every model it matches")));
+  const val = el("div", "val");
+  const b = el("button", "text action", t("Disable…"));
+  b.type = "button";
+  b.id = "disabledAdd";
+  const models = (s.titleModels || []).filter((x) => x.provider);
+  b.onclick = (ev) => openPicker({ id: "", name: "", fields: [] }, { key: "disabledModels", label: "model", value: "",
+    options: models.map((x) => ({ value: x.id, label: x.name || x.id, note: x.providerName, icon: x.icon, group: x.providerName, ref: x.id })),
+    onPick: (id) => {
+      id = String(id || "").trim();
+      if (!id || list.some((p) => p.toLowerCase() === id.toLowerCase())) return;
+      save([...list, id]);
+    } }, b, ev);
+  val.append(b);
+  add.append(who, val);
+  const rows = list.map((pat) => {
+    const r = el("div", "row pref disabled-model");
+    r.dataset.pattern = pat;
+    const w = el("div", "who");
+    const hits = (s.disabledHits || {})[pat] || [];
+    const sub = hits.length
+      ? t("Matches {n}: {list}", { n: hits.length, list: hits.slice(0, 4).join(", ") + (hits.length > 4 ? ", …" : "") })
+      : t("Matches no model now; it is refused if one appears");
+    w.append(el("div", "name", pat), el("div", "sub wraps", sub));
+    const v = el("div", "val");
+    const on = el("button", "text", t("Enable"));
+    on.type = "button";
+    on.setAttribute("aria-label", t("Enable {model}", { model: pat }));
+    on.onclick = () => save(list.filter((p) => p !== pat));
+    v.append(on);
+    r.append(w, v);
+    return r;
+  });
+  box.replaceChildren(add, ...rows);
 }
 
 // REDACT_KINDS are redact.Categories as Settings lists them: id, name,
@@ -24446,7 +24604,7 @@ if (mode === "window" && params.get("view") === "usage") {
   ledPurpose = params.get("purpose") || "";
   ledComputer = params.get("computer") || "";
   const v = params.get("via") || "";
-  ledVia = v === "through" || v === "direct" ? v : "";
+  ledVia = v === "through" || v === "direct" || v === "reported" ? v : "";
   const u = new URL(location.href);
   for (const k of ["tab", "provider", "agent", "computer", "card", "purpose", "via"]) u.searchParams.delete(k);
   history.replaceState(null, "", u);

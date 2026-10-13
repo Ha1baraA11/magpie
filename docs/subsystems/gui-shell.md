@@ -31,6 +31,51 @@ three.
 
 ## Constraints and failure behavior
 
+### Streamed output speed
+
+Usage rows and aggregates use `Record.Decode` and `DecodeOf` in
+[`internal/usage/usage.go`](../../internal/usage/usage.go). Routing uses
+`decodeOf` in [`routing.js`](../../internal/gui/assets/routing.js); Usage
+rows use `ledDecode` in [`app.js`](../../internal/gui/assets/app.js).
+
+When an answer follows reasoning, only answer tokens are timed from the
+first answer text. Without answer text, all output tokens are timed only
+when the gateway records paced visible reasoning and a usable content flow.
+`firstToken.reasoningMs` in
+[`ttft.go`](../../internal/gateway/ttft.go) requires reasoning at the first
+content and subsequent reasoning deltas at least 100 ms later. It excludes
+native Responses and Gemini, whose summaries do not measure their reported
+reasoning tokens, and redacted thinking, including translated sealed blocks.
+The upstream protocol is retained when the client receives a translation.
+These are receive-side timing checks, not access to the vendor's generation
+clock: a relay that releases a buffered reply evenly can still look paced.
+Without an upstream guarantee, this is an observed output-rate estimate.
+Summaries stay excluded rather than extending their visible portion's time
+to an unobserved reasoning-token count.
+
+`Record.FirstReasoning` (`first_reasoning_ms`) and the corresponding
+`Call`, `Route` and `Try` field (`firstReasoning`) record this evidence with
+the same origin as their duration. Historical records have no evidence and
+keep their previous speed. Request-page caches and compressed snapshots
+preserve the optional field; the packed row keeps `ReasoningHidden` in
+its own `Flags` bit (`rowReasoningHidden`), apart from pricing's
+`swapKnown`, which every priced row carries. `ReasoningHidden` (`reasoning_hidden` in the
+ledger, `reasoningHidden` in traces) suppresses a no-text speed even when
+redacted/encrypted thinking has no reported reasoning-token count. A
+Responses summary is marked this way on its own-login path too, and after
+an endpoint fallback, where the try's protocol still names the first
+endpoint, by the upstream that answered (`summaryUpstream` in
+[`continuation.go`](../../internal/gateway/continuation.go)). Optional
+OTel attributes carry the evidence without response text. The existing burst and held-content limits in
+`DecodeOf` still apply, and hidden reasoning does not enter average speed.
+
+`TestVisibleReasoningSpeed`, `TestReasoningSpeedEvidence`,
+`TestReasoningSpeedThroughGateway`, `TestMixedRedactedReasoning`,
+`TestHiddenReasoningThroughTranslation`, `TestSlowReleasedReasoningIsUntimed`,
+`TestPricedRowKeepsReasoningEvidence`, `TestSummaryAfterEndpointFallbackStaysHidden` and
+[`reasoning-speed.test.cjs`](../../internal/gui/tests/reasoning-speed.test.cjs)
+cover the calculation, cache round trip, translated streams and both pages.
+
 ### Routing purpose filter
 
 The request heading's purpose menu in [`routing.js`](../../internal/gui/assets/routing.js)
@@ -211,6 +256,26 @@ dirty group draft; Cancel retains the draft and Discard opens the new editor.
 waits for `show` to accept navigation before creating its draft.
 
 ## Verification
+
+The session readers include Cursor CLI chat stores, Cursor editor project
+transcripts and older editor `cursorDiskKV` conversations. CLI stores win
+when the same session ID has a project transcript. Editor conversations are
+read only, including at the delete API, and cannot be resumed by cursor-agent.
+Project transcripts contain no message timestamps or billing data; their
+existing file modification time supplies the activity date, and tokens and
+cost are not inferred. Database bubbles retain their own timestamps.
+The editor database is opened as one read-only snapshot per listing, shared
+by its chats and removed when the listing ends. Metadata changes invalidate
+the cached summary even if the project transcript has not changed. See
+[`cursor_editor.go`](../../internal/sessions/cursor_editor.go),
+`TestCursorEditorTranscript` and `TestCursorEditorLiveDatabaseAndMetadataRefresh`
+in [`cursor_editor_test.go`](../../internal/sessions/cursor_editor_test.go).
+
+Messages without tokens or an active-time estimate still count as sessions
+in the overview. Cursor and OpenCode conversations can be opened through
+the existing transcript API, including CLI reasoning and tool calls. When the selected date range is empty but
+matching history exists, Usage offers **All sessions**, preserving the agent,
+model, folder and search filters. See `sessions-empty-range.test.cjs`.
 
 ```sh
 go test -tags nogui ./internal/gui

@@ -83,6 +83,9 @@ type Record struct {
 	// none for a reply that wasn't streamed (#196)
 	TTFT      int64 `json:"ttft_ms,omitempty"`
 	FirstText int64 `json:"first_text_ms,omitempty"`
+	// FirstReasoning is the start of paced visible reasoning, absent for hidden reasoning.
+	FirstReasoning  int64 `json:"first_reasoning_ms,omitempty"`
+	ReasoningHidden bool  `json:"reasoning_hidden,omitempty"`
 	// Sent: ms from the request to its answering try going out to the
 	// vendor, its body written, as TTFT is counted: magpie's own time and
 	// the tries that failed first are before it, and TTFT-Sent is how
@@ -166,6 +169,16 @@ type Record struct {
 	// a call brought here by sync (#542); "" for one made here, as every
 	// call in usage.jsonl is
 	Computer string `json:"computer,omitempty"`
+	// Source is SourceReported for a call a client told magpie of through
+	// POST /v1/magpie/usage/requests (#1874), one that went straight to its
+	// vendor and that magpie never saw; "" for the gateway's own. Reported
+	// calls count in the totals and are told apart, and filtered, on the
+	// page.
+	Source string `json:"source,omitempty"`
+	// OwnCost is what such a client said the call cost, in USD. nil when it
+	// said nothing: the call is then priced at magpie's own prices, as the
+	// gateway's calls are, and priced again when those change.
+	OwnCost *float64 `json:"cost,omitempty"`
 	// OTel is transient trace context; SkipOTel avoids exporting ledger records
 	// when the gateway exports its attempts separately. Neither is persisted.
 	OTel     *OTelSpan `json:"-"`
@@ -219,6 +232,14 @@ func Append(r Record) {
 
 // IsRejected also recognizes local rejections written before the explicit flag.
 func (r Record) IsRejected() bool { return r.Rejected || r.Provider == "" && r.Status >= 400 }
+
+// IsReported is a call an app reported itself (#1874), which never went
+// through magpie. It is shown and counted on the Usage page only: nothing
+// that acts on live traffic (a key's budget, a window's holds, the Sessions
+// page's gateway sessions, what a session was routed to, Codex's sealed
+// answers or remembered model) reads it, since it may be a backfill of
+// calls long past and none of them were magpie's to route.
+func (r Record) IsReported() bool { return r.Source == SourceReported }
 
 // Load streams complete records from the log. Historical request bodies are
 // not retained by a global cache after the caller finishes with this snapshot.
@@ -328,8 +349,12 @@ const (
 var Periods = []Period{Today, Week, Month, All}
 
 // CostAt is what the call costs at a price: at the tier its input reaches,
-// its 1-hour cache writes at theirs.
+// its 1-hour cache writes at theirs. A reported call that said what it
+// cost costs that, at any price.
 func (r Record) CostAt(p catalog.Price) float64 {
+	if r.OwnCost != nil {
+		return *r.OwnCost // a reported call's own cost (#1874)
+	}
 	return p.CostSplit(r.Input, r.Output, r.CacheRead, r.CacheWrite, r.CacheWrite1h)
 }
 
@@ -442,7 +467,9 @@ func DecodeWindow(out int, ms, ttft int64) int64 {
 // written before the first content, over time the window from it doesn't
 // hold, and counting them read a 2,000-token think and a 200-token answer
 // in 1.5 s as 1,467 tok/s. Its time goes to the wait before the answer.
-// One with reasoning and no text (all tool calls) tells no speed. The
+// With no answer text, paced visible reasoning can time all output from
+// firstReasoning. Missing evidence (including older records), hidden reasoning
+// and an unknown flow leave the speed untold. The
 // window is DecodeWindow's: 0 for a reply that tells none.
 //
 // A reply its vendor held back and let go in a burst at its end tells
@@ -466,10 +493,16 @@ func DecodeWindow(out int, ms, ttft int64) int64 {
 //     reasoning hidden from the stream (OpenAI's, Claude's omitted) comes
 //     before the first content and leaves this time short; one that
 //     streams comes at the pace its answer does.
-func DecodeOf(out, reasoning int, ms, ttft, firstText, flow int64) (tokens int, w int64) {
+func DecodeOf(out, reasoning int, ms, ttft, firstText, flow int64, firstReasoning ...int64) (tokens int, w int64) {
 	start := ttft
 	if reasoning > 0 {
-		out, start = out-reasoning, firstText
+		if firstText > 0 {
+			out, start = out-reasoning, firstText
+		} else if len(firstReasoning) > 0 && firstReasoning[0] >= ttft && flow > 0 && reasoning <= out {
+			start = firstReasoning[0]
+		} else {
+			return 0, 0
+		}
 	}
 	if ttft <= 0 {
 		return 0, 0
@@ -480,7 +513,7 @@ func DecodeOf(out, reasoning int, ms, ttft, firstText, flow int64) (tokens int, 
 	if flow > 0 && flow*HeldShare < w {
 		return 0, 0
 	}
-	if reasoning > 0 && int64(out)*(firstText-ttft) > ThinkPace*int64(reasoning)*w {
+	if reasoning > 0 && firstText > 0 && int64(out)*(firstText-ttft) > ThinkPace*int64(reasoning)*w {
 		return 0, 0
 	}
 	return out, w
@@ -497,7 +530,10 @@ const (
 
 // Decode is the record's DecodeOf.
 func (r Record) Decode() (tokens int, w int64) {
-	return DecodeOf(r.Output, r.Reasoning, r.Millis, r.TTFT, r.FirstText, r.Flow)
+	if r.ReasoningHidden && r.FirstText <= 0 {
+		return 0, 0
+	}
+	return DecodeOf(r.Output, r.Reasoning, r.Millis, r.TTFT, r.FirstText, r.Flow, r.FirstReasoning)
 }
 
 // FormatCost renders an effective-price cost, kept in USD everywhere it's
@@ -920,7 +956,7 @@ func Vias(since time.Time) map[string][]Via {
 func buildVias(snapshot *logSnapshot, since time.Time) map[string][]Via {
 	out := map[string][]Via{}
 	snapshot.visit(since, func(r Record) {
-		if r.IsRejected() || r.Session == "" || r.Model == "" {
+		if r.IsRejected() || r.IsReported() || r.Session == "" || r.Model == "" {
 			return
 		}
 		k := AgentOf(r.Agent) + "|" + r.Session

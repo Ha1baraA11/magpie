@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -430,7 +431,20 @@ func checkStdio(ctx context.Context, s *Server) ServerHealth {
 		return failed("novar", strings.Join(unset, ", "))
 	}
 	cmd := proc.Command(s.Command, s.Args...)
+	// Agents start MCP servers from a project or home directory. A magpie
+	// launched from a shortcut (Windows Start menu) often has C:\Windows\system32
+	// as its own cwd, which is not writable; inherit that and a server that
+	// writes into "." dies as "exited (1)" with no log. Pin the check to HOME.
 	cmd.Env = os.Environ()
+	if d := home(); d != "" {
+		cmd.Dir = d
+		// and PWD with it, as exec does itself only when Env is nil: a
+		// shell-script server that reads $PWD would otherwise see magpie's
+		// own folder while it runs in home (Windows doesn't use PWD)
+		if runtime.GOOS != "windows" {
+			cmd.Env = append(cmd.Env, "PWD="+d)
+		}
+	}
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

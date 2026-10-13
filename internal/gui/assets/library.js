@@ -232,11 +232,13 @@
     // the row it is put in says so (.with-agents), for its name's room:
     // Safari before 15.4 has no :has(). Every caller appends it at once.
     queueMicrotask(() => box.parentElement?.classList.contains("lib-row") && box.parentElement.classList.add("with-agents"));
-    for (const a of all) {
+    for (const [i, a] of all.entries()) {
       const always = opts.always?.(a) || "";
       const has = on.includes(a.id) || !!always;
       const c = el("button", "lib-ag" + (has ? " on" : "") + (always ? " always" : ""));
       c.dataset.agent = a.id;
+      // how many chips are to its right, how far it slides into the hand
+      c.style.setProperty("--k", all.length - 1 - i);
       c.append(agentIcon(a.icon));
       if (opts.names) c.append(el("span", "n", a.name));
       const problem = !always && opts.problems?.[a.id];
@@ -1407,8 +1409,19 @@
   const toolsOpen = new Set(); // the servers whose tools are shown
   const healthKey = (s) => JSON.stringify([s.transport, s.command, s.args, s.env, s.url, s.headers, s.signIn]);
   const toolList = (name) => { const h = health.get(name)?.h; return h?.state === "ok" ? h.toolList || [] : []; };
-  // whether any agent gets the server, here or in a project magpie keeps
-  const inUse = (s) => !!s.agents?.length || (lib.projects || []).some((p) => p.servers?.[s.name]?.length);
+  // whether an agent the page shows gets the server, here or in a project
+  // magpie keeps whose folder is there. The library keeps every agent it
+  // gave a server to, those the page leaves out too: one hidden on the
+  // Agents page, one no longer installed, one with no MCP of its own. A
+  // server on only for those has every chip off, and isn't started for
+  // them on its own (#1597, xiaozhu1337: ida-pro-mcp and windbg-mcp were)
+  const inUse = (s) => {
+    const shown = new Set(mcpAgents().map((a) => a.id)), inProjects = new Set(projectMCPAgents().map((a) => a.id));
+    return (s.agents || []).some((id) => shown.has(id))
+      || (lib.projects || []).some((p) => !p.missing && (p.servers?.[s.name] || []).some((id) => inProjects.has(id)));
+  };
+  // whether the library has it on for anyone at all, shown here or not
+  const onAnywhere = (s) => !!s.agents?.length || (lib.projects || []).some((p) => p.servers?.[s.name]?.length);
   // a click checks a server again, or for the first time one in no use;
   // not while it is being checked
   function recheck(name) {
@@ -1585,7 +1598,7 @@
         b.hidden = !s || inUse(s);
         b.className = "lib-health idle";
         b.replaceChildren(el("span", "", t("not checked")));
-        b.title = t("No agent has it, so it isn't checked on its own") + "\n" + t("Click to check it");
+        b.title = t(s && onAnywhere(s) ? "No agent shown here has it on, so it isn't checked on its own" : "No agent has it, so it isn't checked on its own") + "\n" + t("Click to check it");
         continue;
       }
       b.hidden = false;

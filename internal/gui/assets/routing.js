@@ -286,17 +286,19 @@
   // (usage.DecodeOf, John on Discord: Kimi Code at 2,237 tok/s): its
   // content came in under a quarter of its window (flow), or its answer
   // at over 20 times the pace its reasoning came before its first text.
-  function decodeOf(r, ms, ttft, firstText, flow = r.flow) {
-    const think = reasoningOf(r), n = think > 0 ? r.out - think : r.out, from = think > 0 ? firstText : ttft;
+  function decodeOf(r, ms, ttft, firstText, flow = r.flow, firstReasoning = r.firstReasoning, reasoningHidden = r.reasoningHidden) {
+    if (reasoningHidden && !(firstText > 0)) return null;
+    const think = reasoningOf(r), visible = think > 0 && !(firstText > 0) && firstReasoning >= ttft && flow > 0 && think <= r.out;
+    const n = think > 0 && !visible ? r.out - think : r.out, from = visible ? firstReasoning : think > 0 ? firstText : ttft;
     const w = ms - from;
     if (!(n > 0 && ttft > 0 && from > 0 && w >= 100 && n * 1000 <= 10000 * w)) return null;
     if (flow > 0 && flow * 4 < w) return null;
-    if (think > 0 && n * (firstText - ttft) > 20 * think * w) return null;
+    if (think > 0 && firstText > 0 && n * (firstText - ttft) > 20 * think * w) return null;
     return { n, w };
   }
   const reasoningOf = (r) => r.reasoning ?? (r.usage?.length ? r.usage[r.usage.length - 1].reasoning || 0 : 0);
-  const speedOf = (r, ms = r.ms, ttft = r.ttft, firstText = r.firstText, flow = r.flow) => {
-    const d = decodeOf(r, ms, ttft, firstText, flow);
+  const speedOf = (r, ms = r.ms, ttft = r.ttft, firstText = r.firstText, flow = r.flow, firstReasoning = r.firstReasoning, reasoningHidden = r.reasoningHidden) => {
+    const d = decodeOf(r, ms, ttft, firstText, flow, firstReasoning, reasoningHidden);
     return d ? d.n / (d.w / 1000) : 0;
   };
   function promptOf(r) {
@@ -342,7 +344,7 @@
       cache: ["cache-hit", "Cache", prompt ? pct(100 * read / prompt) : "—",
         t("Cache hit rate") + ": " + t("The share of the prompt read from the cache")],
       speed: ["speed", "Speed", speed ? t("{n} tok/s", { n: Math.round(speed) }) : "—",
-        t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it")],
+        t("Output tokens a second after the first, over the streamed replies") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed")],
       cost: ["cost", "Cost", routeCost(r), r.priced ? costNote() : t("No known price or token counts for this request")],
     };
     return visibleMetrics.map((key) => values[key]).filter((metric) => metric[2] !== "—");
@@ -358,7 +360,7 @@
   function firstNote(r, tr) {
     let s = tr.ttft ? " · " + t("first token in {ms}", { ms: took(tr.ttft) }) : "";
     if (tr.ttft && tr.firstText > tr.ttft) s += " · " + t("first text in {ms}", { ms: took(tr.firstText) });
-    const v = speedOf(r, tr.ms, tr.ttft, tr.firstText, tr.flow);
+    const v = speedOf(r, tr.ms, tr.ttft, tr.firstText, tr.flow, tr.firstReasoning || 0, tr.reasoningHidden || false);
     if (v) s += " · " + t("{n} tok/s", { n: Math.round(v) });
     const { prompt, read } = promptOf(r);
     if (prompt) s += " · " + t("request cache hit rate {p}", { p: pct(100 * read / prompt) });
@@ -407,6 +409,9 @@
   // or the user set the account or key to serve other models only (#474)
   // or it is held at the usage cap the user set on the account
   const unlistedWord = (w) => w.held ? t("not an account the gateway key may use") : w.noCredits ? t("held: its allowance used up, set not to spend credits") : w.capped ? t("held at its {cap}% usage cap", { cap: w.capped }) : w.barred ? t("set to serve other models, not {model}", { model: w.model }) : w.kind === "key" ? t("{name}'s list for this key has no {model}", { name: w.name, model: w.model }) : t("its plan doesn't list {model}", { model: w.model });
+  // noURLWord: its keys are all set to a protocol its provider has no URL
+  // for, so it went out on the URLs it has (#1702)
+  const noURLWord = (w) => t("key set to {api} only, no {api} URL · sent on the others", { api: API[w.noURL] || w.noURL });
   const group = (w) => w.used >= 98 ? "spent" : w.used >= 90 ? "low" : "fine";
   const renews = (w) => (w.renews || []).map((s) => known0(s) ? at(s) : 0);
   // usedRenews is when the window w.used is the share of renews: a row
@@ -1502,6 +1507,7 @@
       else if (trying.has(id)) s = r.id !== cur.id && agents.size <= 1 ? t("answering another request…") : t("answering…");
       else if (answered.has(id)) s = agents.size > 1 ? t("answered {agent}", { agent: agentName(r.agent) }) : t("answered this request");
       else if (gave.has(id)) s = t("{status} · {fail} · passed to {agent}", { status: gave.get(id).status, fail: failWord(gave.get(id).fail), agent: agentName(r.agent) });
+      else if (w.noURL) s = noURLWord(w);
       else if (w.sunk) s = t("rate limited at {time} · at the back", { time: clock(w.sunk) });
       else if (w.known) {
         const soon = usedRenews(w);
@@ -1761,13 +1767,31 @@
     const key = JSON.stringify([r.kind, items.map(([s, c, tr]) => [s, c, tr?.model, tr?.served]), r.order.map(logoOf)]);
     if (stepsKey === key) return;
     stepsKey = key;
-    steps.replaceChildren(...items.map(([s, c, tr]) => {
+    // A line that says the same stays the very node it was, and a new line
+    // takes its logo from one going: a logo made afresh loads its picture
+    // again and, in WebKit, blinks out for a frame, and the story is drawn
+    // again on every request that comes in and at each of its steps, so
+    // with an agent at work every logo in it blinked on and off
+    const logos = r.order.map(logoOf);
+    const was = new Map([...steps.children].map((li) => [li.dataset.k, li]));
+    const lis = items.map(([s, c, tr]) => {
+      const k = JSON.stringify([r.kind, s, c, tr?.model, tr?.served, logos]);
+      const old = was.get(k);
+      if (old) { was.delete(k); return { li: old }; }
+      return { k, s, c, tr };
+    });
+    keepIcons(...was.values());
+    replaceKeeping(steps, lis.map((x) => {
+      if (x.li) return x.li;
+      const { k, s, c, tr } = x;
       const li = el("li", c);
+      li.dataset.k = k;
       li.append(...(/^(why|ok|bad|wait|aside)$/.test(c) ? logoed(s, r) : [s]));
       if (c === "aside kind") li.prepend(kindTag(r), " ");
       if (c === "swap") li.prepend(swapTag(tr), " ");
       return li;
     }));
+    keptIcons = null;
   }
 
   // pick sets the stage to a past request, or back to live with the newest.
@@ -2159,7 +2183,7 @@
       if (g.key && visibleMetrics.includes("cache") && total.prompt) meta.push(metricElement(["cache-hit", "Avg. cache", pct(100 * total.read / total.prompt),
         t("Total cache reads divided by total prompt tokens; larger prompts carry more weight") + "\n" + coverage(total.cached)]));
       if (g.key && visibleMetrics.includes("speed") && total.decodeMs) meta.push(metricElement(["speed", "Avg. speed", t("{n} tok/s", { n: Math.round(total.decodeOut * 1000 / total.decodeMs) }),
-        t("Total output tokens divided by total decode time; excludes waiting and replies without usable timing") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + "\n" + coverage(total.timed)]));
+        t("Total output tokens divided by total decode time; excludes waiting and replies without usable timing") + ". " + t("A reply that reasoned counts only its answer, from its first text: the reasoning was written before the stream showed it") + ". " + t("No answer text: speed includes reasoning only when visible reasoning streamed; hidden reasoning has no speed") + "\n" + coverage(total.timed)]));
       const metaSig = JSON.stringify([bits, tokenHelp, meta.map((e) => [e.textContent, e.title])]);
       if (x.meta.dataset.sig !== metaSig) { x.meta.replaceChildren(...meta); x.meta.dataset.sig = metaSig; }
       setText(x.cost, total.priced ? "≈" + fmtCost({ cost: total.cost, unpriced: 0 }) + (total.unpriced ? "+" : "") : "");
@@ -2337,6 +2361,8 @@
       + (x.resetsAt ? " · " + resetInText(new Date(x.resetsAt)) : "")) : [];
   }
 
+  // when each rest was lifted by hand, by the key it rests by (#1869)
+  const liftedAt = new Map();
   // each account or key the kept requests weighed: how often it was
   // tried, answered and failed in them, and how the latest found it
   function renderActs(rs) {
@@ -2367,6 +2393,9 @@
         if (tr.rest && end >= a.restAt) { a.rest = tr.rest; a.restAt = end; }
       }
     }
+    // a rest lifted by hand since the request that found it (#1869): the
+    // kept requests still say it, until the next one asks it again
+    for (const a of by.values()) if (a.rest?.key && (liftedAt.get(a.rest.key) || 0) >= a.restAt) a.rest = null;
     const list = [...by.values()].sort((x, y) => (x.w.name || "").localeCompare(y.w.name || "") || x.w.provider.localeCompare(y.w.provider) || rankOf(x.w) - rankOf(y.w) || x.pos - y.pos);
     setText(actLabel, t("Accounts and keys"));
     setText(actNote, t("over those requests"));
@@ -2416,6 +2445,7 @@
       const resting = a.rest && at(a.rest.until) > n;
       if (resting) { st = `${failWord(a.rest.why)} · ${restWhen(a.rest)}`; cls = "rest"; }
       else if (w.unlisted) { st = unlistedWord(w); cls = "left"; }
+      else if (w.noURL) st = noURLWord(w);
       else if (w.known) {
         const soon = usedRenews(w);
         st = soon && soon <= n ? quota(w, "{n} used at {time}; it has renewed since", "{n} left at {time}; it has renewed since", { time: clock(a.at) })
@@ -2449,15 +2479,20 @@
         ms.append(...mdls.map((m) => el("code", "mdl", m)));
         row.append(ms);
       }
-      if (resting && (a.rest.why === "verify" || a.rest.why === "restricted")) {
-        // the vendor wants the account verified (#152), or restricted it
-        // until an appeal lifts it (#1849): where, and a way to stop its
-        // rest once it is
+      if (resting && a.rest.key) {
+        // any rest can be lifted by hand (#1869): a quota, a backoff, a
+        // Retry-After, a network blip read as down. It only ends the rest;
+        // the vendor refusing again rests it again as before. The vendor
+        // wants the account verified (#152), or restricted it until an
+        // appeal lifts it (#1849): where, and the way to stop its rest
+        // once it is
         const fix = el("div", "fix"), rest = a.rest;
         if (rest.link) { const b = el("button", "link", t("Verify the account ↗")); b.onclick = () => api("open", { url: rest.link }).catch(() => {}); fix.append(b); }
-        const go = el("button", "link", t(rest.why === "restricted" ? "The restriction is lifted — try it again" : "It's verified — try it again"));
+        const go = el("button", "link", t(rest.why === "restricted" ? "The restriction is lifted — try it again"
+          : rest.why === "verify" ? "It's verified — try it again" : "Try now"));
+        if (rest.why !== "restricted" && rest.why !== "verify") go.title = t("Ends the rest: the next request asks it again. Refused again, it rests again.");
         go.onclick = async () => {
-          try { await api("gateway/unrest", { key: rest.key }); rest.until = new Date().toISOString(); render(); } catch (e) { go.textContent = e.message; }
+          try { await api("gateway/unrest", { key: rest.key }); liftedAt.set(rest.key, Date.now()); render(); } catch (e) { go.textContent = e.message; }
         };
         fix.append(go);
         row.append(fix);
@@ -3052,6 +3087,16 @@
         } else {
           if (cur && routes.has(cur.id) && !rp) cur = routes.get(cur.id);
           if (pinned && routes.has(pinned.id)) pinned = routes.get(pinned.id);
+          // a request picked (in the list, or the tray panel's row that
+          // opened the window) goes back to live once it has left the list,
+          // as a filter that leaves it out does: the stage stayed on one
+          // provider's request for hours while every request since went to
+          // another (#1389, Creat55)
+          else if (pinned && !day) {
+            pinned = null;
+            cur = newest();
+            if (cur) { sync(true); say(affWhy(cur, true) || ruleWhy(cur, true) || firstWhy(cur)); }
+          }
           if (!pinned && !rp) {
             cur = newest();
             if (cur) sync();
@@ -4788,11 +4833,15 @@
 
   // ---- the stage: agents → magpie → providers ----
   // Three a side at most, each kept where it is while it stays: one that
-  // comes takes the place of the one heard of longest ago. A request plays
-  // as a dot in its agent's colour: to magpie, on to the account it was
-  // routed to, waiting there while that answers; a try that failed turns
-  // red and comes back for the next, and the answer flies home green (red
-  // when nobody could answer). Still, with reduced motion or the tab hidden.
+  // comes takes the place of the one heard of longest ago. On the right a
+  // place is a provider, naming the account its latest try went to: a place
+  // an account let one provider, its requests trying account after account,
+  // fill all three, and the providers other sessions used were left off
+  // (#1389, Creat55). A request plays as a dot in its agent's colour: to
+  // magpie, on to the provider it was routed to, waiting there while that
+  // answers; a try that failed turns red and comes back for the next, and
+  // the answer flies home green (red when nobody could answer). Still,
+  // with reduced motion or the tab hidden.
   const P_SIDE = 3;
   const pStage = el("div", "pr-stage");
   const pWires = document.createElementNS(NS, "svg"), pSky = document.createElementNS(NS, "svg");
@@ -4803,15 +4852,16 @@
   pStage.append(pWires, pFrom, pHub, pTo, pSky);
   pStage.setAttribute("aria-hidden", "true");
   let pAg = [], pDst = [];          // the keys on the stage, in their places
-  const pNodes = new Map();         // "a:<agent>" / "d:<seat>" → { node, wire }
+  const pNodes = new Map();         // "a:<agent>" / "d:<provider>" → { node, wire }
   const pPlays = new Set();         // the requests flying
   let pTrips = [], pWait = [], pRaf = 0;
-  // pSeat is where a try went: a provider, and the account or key there
+  // pSeat is where a try went: its place, the provider, and the account
+  // or key there
   function pSeat(r, tr) {
     const w = tr && tried(r, tr);
     if (!w) return { key: r.provider || "?", name: r.provider || "?", sub: "" };
     const sub = w.kind === "provider" ? "" : w.who || "";
-    return { key: `${w.provider}|${sub}`, name: w.name || w.provider, sub };
+    return { key: w.provider || r.provider || "?", name: w.name || w.provider, sub };
   }
   // pPlace keeps those on the stage that are still wanted where they are,
   // the newcomers taking the free places
@@ -4834,11 +4884,12 @@
       const tr = r.tries[r.tries.length - 1];
       if (tr) { const s = pSeat(r, tr); if (!dst.has(s.key) && dst.size < P_SIDE) dst.set(s.key, s); }
     }
-    // each account on the stage says how its latest try there went
+    // each provider on the stage names the account its latest try went
+    // to, and says how that went
     for (const r of recent) {
       for (const x of r.tries.slice().reverse()) {
-        const d = dst.get(pSeat(r, x).key);
-        if (d && !d.how) d.how = !x.done ? "wait" : tryOk(x) ? "ok" : "bad";
+        const s = pSeat(r, x), d = dst.get(s.key);
+        if (d && !d.how) { d.how = !x.done ? "wait" : tryOk(x) ? "ok" : "bad"; d.sub = s.sub; }
       }
     }
     pAg = pPlace(pAg, ags.slice(0, P_SIDE));
@@ -4946,10 +4997,15 @@
     dot.style.setProperty("--agent", hueOf(r.agent));
     pSky.appendChild(dot);
     const home = () => pNodes.get("a:" + r.agent);
+    // rt: the route as the gateway has it now — or, dropped from the 60
+    // kept while it flew, over: its dot goes, as nothing more will be heard
+    // of it. Waiting on it held the dot and its place for three minutes
+    const rt = () => routes.get(id) || { ...r, done: true, gone: true };
     try {
       await pFly(dot, home(), false, 420);
       for (let i = 0; ; i++) {
-        await pUntil(() => { r = routes.get(id) || r; return r.tries.length > i || r.done; });
+        await pUntil(() => { r = rt(); return r.tries.length > i || r.done; });
+        if (r.gone) break;
         const tr = r.tries[i];
         if (!tr) break;
         const k = "d:" + pSeat(r, tr).key;
@@ -4959,15 +5015,17 @@
         // it waits at the account while that answers
         if (n) n.lit++;
         dot.classList.add("wait");
-        await pUntil(() => { r = routes.get(id) || r; return r.tries[i]?.done || r.done; });
+        await pUntil(() => { r = rt(); return r.tries[i]?.done || r.done; });
         dot.classList.remove("wait");
         if (n && !--n.lit) n.wire.classList.remove("on");
+        if (r.gone) break;
         const t2 = r.tries[i];
         if (t2 && !tryOk(t2)) {
           dot.classList.add("bad");
           await pRest(260);
           await pFly(dot, n, true, 360);
-          await pUntil(() => { r = routes.get(id) || r; return r.tries.length > i + 1 || r.done; });
+          await pUntil(() => { r = rt(); return r.tries.length > i + 1 || r.done; });
+          if (r.gone) break;
           if (r.tries.length > i + 1) { dot.classList.remove("bad"); continue; }
           await pFly(dot, home(), true, 420); // nobody left: the error goes home
           break;

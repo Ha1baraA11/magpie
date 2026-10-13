@@ -349,16 +349,17 @@ high. A floor never mixes into a measured speed: the Speed trend and
 A group's speed (a row of the Usage page's ranking, by model, provider or
 agent, its Output speed card, and the overview's lists) says how many
 replies it is of, by one rule: with replies whose speed was measured, their
-speed and how many they are (`125 tok/s (1)`, not beside "260 requests"
-alone); with rows that tell a floor, the least those wrote at and how many
-(`≥100 tok/s (30)`); with both, both, the measured first
-(`125 tok/s (1) · ≥50 tok/s (259)`), as a few measured replies may not
-stand for the rest and a floor is no measure; with neither, nothing. The
-Output speed card shows the measured speed as its figure and the floor
-under it. The tooltip says what each is of. A ranking by speed orders and
-bars a group by its measured speed, or its floor when it has none
-(`usage.Totals` `decode_n`, `floor_out`, `floor_ms`, `floor_n`;
-`usage.Row.Floor`).
+speed and how many they are (`62 tok/s · 2 timed replies`, not beside "260
+requests" alone); with rows that tell a floor, the least those wrote at and
+how many (`≥100 tok/s · 30 replies`); with both, both, the one of more
+replies first (`≥50 tok/s · 259 replies; 125 tok/s · 1 timed reply`), as a
+few measured replies may not stand for the rest; with neither, nothing.
+Counts are words, never a bare number in parentheses. The Output speed card
+shows the first as its figure, its count beside it, the other under it, and
+the mean wait for the first token on a line of its own with how many timed
+replies it is of. The tooltip says what each is of. A ranking by speed
+orders and bars a group by the figure it shows first (`usage.Totals`
+`decode_n`, `floor_out`, `floor_ms`, `floor_n`; `usage.Row.Floor`).
 
 It lists **accounts** too: each Codex, Claude or other subscription account's
 tokens and cost, by the account that actually answered — the one that took
@@ -1565,6 +1566,42 @@ in either. Like `/v1/magpie/quotas`, they answer this machine, and another
 only with a gateway key. A key held to a budget, to some models or to some
 accounts is told its own calls alone: `/v1/magpie/usage` refuses it with a
 403, and `/v1/magpie/usage/requests` keeps only its rows and filter lists.
+
+An app that calls its vendor itself, not through magpie, can report those
+calls so the Usage page counts them: `POST /v1/magpie/usage/requests` with
+`Content-Type: application/json`. The body is one record or an array of up
+to 5000 (32 MiB at most), shaped like a `usage.jsonl` line:
+
+```sh
+curl -s http://127.0.0.1:3425/v1/magpie/usage/requests \
+  -H 'Content-Type: application/json' \
+  -d '[{"t":"2026-10-13T08:00:00Z","agent":"my-app","provider":"anthropic",
+        "model":"claude-sonnet-4-6","in":1200,"out":340,"cache_read":9000,
+        "cache_write":0,"ms":2400,"ttft_ms":610,"status":200,"rid":"req_01"}]'
+```
+
+- **Fields:** `t` (RFC 3339), `agent`, `provider`, `model` and `rid` are
+  required. `in`, `out`, `cache_read`, `cache_write`, `cache_write_1h`,
+  `reasoning`, `ms`, `ttft_ms`, `status`, `cost` (USD), `effort`,
+  `session` and `err` may be left out.
+- **Pricing:** a record without `cost` is priced at magpie's prices for
+  its provider and model.
+- **Past times:** `t` is taken as given, however far back, so a history
+  can be backfilled; it may not be before 2000-01-01T00:00:00Z or more
+  than an hour ahead.
+- **Repeats:** a `rid` already reported is skipped, after a restart too,
+  so a batch can be sent again.
+- **Refusals:** a bad record refuses the whole post with a 400 naming it,
+  as `error.index` and `error.param` (`record 3: in: must not be
+  negative`), and nothing is written.
+- **The reply:** `{"accepted":1,"skipped":0,"records":[{"index":0,"rid":"req_01","status":"accepted"}]}`.
+- **Showing:** reported rows carry `source: "reported"`, count in every
+  total, and can be listed alone with `via=reported` (`reported` in the
+  GET's reply has their totals).
+- **Nothing live:** they never count against a gateway key's limit or a
+  budget, a subscription window, an alert, a rate limit or routing.
+- **Who may post:** the same as the GETs: this machine, or another with a
+  gateway key. A web page needs a key even on this machine.
 
 A row's `session` is the conversation it belongs to. A Claude Code
 subagent's call keeps its parent conversation there and adds `subagent`,

@@ -60,6 +60,11 @@ type Fake struct {
 	// NoRegistration leaves the registration endpoint out of the metadata,
 	// as GitHub's does: only an app made beforehand (AddApp) signs in
 	NoRegistration bool
+	// Assign is a server that registers the client for another of the
+	// methods it supports than the one asked for, as RFC 7591's
+	// registration response lets it: the token endpoint takes it as
+	// registered
+	Assign string
 
 	refuse  bool // RefuseTokens
 	codes   map[string]codeGrant
@@ -117,6 +122,9 @@ func New(t *testing.T) *Fake {
 		var reg map[string]any
 		json.NewDecoder(r.Body).Decode(&reg)
 		method, _ := reg["token_endpoint_auth_method"].(string)
+		if f.Assign != "" {
+			method = f.Assign
+		}
 		f.mu.Lock()
 		if f.RefuseRegistration {
 			f.mu.Unlock()
@@ -129,7 +137,8 @@ func New(t *testing.T) *Fake {
 		id := fmt.Sprintf("client-%d", len(f.Registered))
 		// private_key_jwt and tls_client_auth need a key set or a
 		// certificate the registration didn't give
-		ok := slices.Contains(methods(), method) && method != "private_key_jwt" && method != "tls_client_auth"
+		// (a method the server assigns is one it supports, listed or not)
+		ok := (f.Assign != "" || slices.Contains(methods(), method)) && method != "private_key_jwt" && method != "tls_client_auth"
 		out := map[string]any{"client_id": id, "redirect_uris": reg["redirect_uris"], "token_endpoint_auth_method": method}
 		if ok && method != "none" {
 			f.secrets[id] = "secret-" + id
